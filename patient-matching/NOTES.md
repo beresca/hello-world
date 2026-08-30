@@ -665,13 +665,207 @@ only the fields Splink can see, uncertainty here is the *correct*
 response, not a bug — we only know it's actually a match because we
 generated the data and kept the answer key.
 
+## Step 6: address-weight diagnostic + evaluation harness (2026-08-30)
+
+### Diagnostic: is the +9.88 address weight trustworthy?
+
+Prompted by the address comparison's learned weight (+9.88, nearly as
+strong as DOB's +9.83) looking suspiciously high given that EMS addresses
+are supposed to be an unreliable field. Checked both halves of the m/u
+ratio directly against the data rather than trusting the trained number
+at face value:
+
+**True-match address agreement** (from `data/synthetic_ems_ehr_pairs.csv`,
+the Step 2 generator's own output): of 250 true matches, 218 have an
+address on both sides (32 have at least one side blank). Of those 218:
+**121 (55.5%) are identical, 97 (44.5%) are mismatched.** This lines up
+with Step 2's design (40% chance of a scene address, plus some
+independent blank-address noise) and looks realistic — no problem here.
+
+**Non-match coincidental address agreement**: checked at two scales.
+Among our 250 designed non-match pairs, **0 of 233** non-blank pairs
+share an identical address. Among the *entire* 250,000-pair cross-join
+(249,750 genuine non-matches), **0 of 225,282** non-blank comparisons
+share an identical address — a full-population check, not just a sample.
+**The true coincidence rate in this dataset is exactly zero.**
+
+That's the mechanism, but it doesn't fully explain the numbers: Splink's
+trained u-probability for an exact address match is **0.000537**, not
+literally 0 (a literal 0 would make the weight infinite, which is one
+reason model-fitting code generally avoids landing on it). Tracing why:
+`linker.training.estimate_u_using_random_sampling()` estimates u by
+randomly sampling pairs from the *entire* cross-join and assuming they're
+all non-matches — Splink's own docs are explicit that this is an
+approximation ("the validity of the u values rests on the assumption
+that the resultant pairwise comparisons are non-matches... for large
+datasets, this is typically true"). Our dataset doesn't fully satisfy
+that assumption: true matches are 250 of 250,000 pairs (0.1%), and since
+55.5% of those true matches happen to share an identical address, some of
+them inevitably get swept into the "assumed non-match" sample used to
+estimate u. The arithmetic is consistent with exactly this: 250 × 0.555 ≈
+139 true-match "leaks" spread across a ~250,000-row sample works out to
+≈0.00056 — very close to the actual trained value of 0.000537. In other
+words, **the learned u for address is essentially measuring diluted
+true-match agreement, not genuine non-match coincidence** — because
+genuine non-match coincidence is, in this dataset, really zero.
+
+**Verdict: the address weight is not fully trustworthy, and the reason
+is a real gap in the synthetic generator, not a modeling mistake.** Two
+compounding synthetic-data artifacts inflate it:
+1. Faker draws an effectively unique, unrelated full street address for
+   every independent fake identity — there's no mechanism for two
+   *different* people to plausibly share an address (no simulated family
+   members at the same home, no shared apartment complex, no generic
+   downtown/PO-box address a call center might reuse). Real-world
+   non-match address collisions are not this rare.
+2. Because true-match density is unusually high in this small, curated
+   dataset (0.1%) compared to a real record-linkage deployment (often
+   far below 0.01%), Splink's u-sampling approximation leaks more
+   true-match signal into the "assumed non-match" pool than it would at
+   real-world scale.
+Both effects push the u-probability artificially low, which inflates
+`log2(m/u)` for address independent of whether address is actually that
+strong a real-world signal. **Follow-up:** add deliberate non-match
+address collisions to the Step 2 generator (shared family address,
+common apartment-complex address, a small pool of reused generic
+addresses) before trusting this weight for anything beyond this
+prototype.
+
+### Evaluation harness
+
+`src/evaluate_matching.py` re-runs Step 5's training/prediction pipeline
+in memory (the 56MB full cross-join file isn't committed to git, so this
+regenerates it fresh in under a second rather than depending on a stale
+local file) and reports:
+
+**1. Precision/recall/F1 across thresholds — full 250,000-pair
+cross-join** (the realistic, heavily imbalanced population, not the
+curated 500-pair set):
+
+| threshold | tp | fp | fn | precision | recall |
+|---|---|---|---|---|---|
+| 0.001 | 250 | 861 | 0 | 0.2250 | 1.0000 |
+| 0.05  | 249 | 86  | 1 | 0.7433 | 0.9960 |
+| 0.5   | 248 | 22  | 2 | 0.9185 | 0.9920 |
+| 0.9   | 248 | 10  | 2 | 0.9612 | 0.9920 |
+| 0.99  | 245 | 2   | 5 | 0.9919 | 0.9800 |
+
+This is the number that actually matters for picking a threshold, and
+it's a meaningfully different (harder) picture than Step 5's headline
+result: at threshold 0.5, precision on the full population is **0.9185**,
+not the 1.0 the curated 500-pair evaluation showed. Confusion matrix at
+0.5:
+
+```
+                     predicted match   predicted non-match
+actual match                    248                     2
+actual non-match                 22               249,728
+```
+
+**What the 22 false positives actually look like** (inspected directly,
+not just counted): the single highest-scoring false positive (probability
+0.993) is "James Smith" vs. "James Smith" — two genuinely different
+people in the synthetic data who happen to share a common first and last
+name, with completely different addresses and one missing DOB. The model
+currently gives an exact name match the same weight regardless of how
+common the name is — Splink supports **term-frequency adjustments** for
+exactly this (a rarer name should count as stronger evidence than a
+common one), and `cl.NameComparison` even sets up the metadata for it,
+but we never actually estimated/enabled term frequency tables in Tier 3.
+**This is a concrete, evidence-based argument for adding term-frequency
+adjustment in a future revision**, not a hypothetical one — it's the
+single largest error class the full-population evaluation surfaced.
+
+**2. Confusion matrix on the 500 designed pairs** (for continuity with
+Steps 3-5): precision 1.0000, recall 0.9920 (248/250, same 2 misses as
+above — the curated set simply never generates a "James Smith" style
+coincidence, since its 250 non-match identities were drawn independently
+and none happened to collide).
+
+**3. Breakdown by EMS-side MRN presence** (500 designed pairs, threshold
+0.5) — checking whether Tier 3 is equally reliable regardless of whether
+Tier 1 also had a shot at a given pair:
+
+| group | n | true matches | precision | recall |
+|---|---|---|---|---|
+| MRN absent on EMS side | 469 | 239 | 1.0000 | 0.9916 |
+| MRN present on EMS side | 31 | 11 | 1.0000 | 1.0000 |
+
+No meaningful difference — Tier 3 doesn't lean on MRN presence to perform
+well, which is the right result (MRN, when present, is Tier 1's job
+entirely; Tier 3 needs to carry pairs where it's absent, which is 94% of
+true matches per Step 3).
+
+**4. Breakdown by last-name length** (longer of the two sides, 500
+designed pairs, threshold 0.5) — checking whether the short-name
+Jaro-Winkler weakness (Step 4.5's "Liu"→"iu", Step 5's lowest-scoring
+true match) still shows up as a measurable recall gap now that Soundex is
+in the model:
+
+| last name length | n | true matches | precision | recall | missed |
+|---|---|---|---|---|---|
+| ≤4 chars | 39 | 38 | 1.0000 | 0.9737 | 1 |
+| 5-7 chars | 328 | 164 | 1.0000 | 0.9939 | 1 |
+| 8+ chars | 133 | 48 | 1.0000 | 1.0000 | 0 |
+
+**The gap is still there, and it's exactly where expected**: the ≤4-char
+bucket has the lowest recall (97.4%, missing 1 of 38 — this is "Liu"→"iu"
+itself), and 5-7 chars misses one more (the "Berry"→"erry" case from
+Step 5). Adding Soundex/NYSIIS to the model did **not** close this gap,
+because the specific failure mode is a dropped *first* letter, which
+breaks the phonetic code the same way it breaks Jaro-Winkler (a name's
+sound, not just its spelling, changes when its first letter is missing).
+Both pairs still cleared the classification threshold overall only
+because DOB and other fields carried enough weight to compensate — see
+the caveat below about why that safety margin may not be real-world
+representative.
+
+### Caveat: this separation reflects synthetic noise levels, not real-world performance
+
+Step 5 reported zero overlap between true-match and non-match probability
+distributions on the 500 designed pairs, and it's worth being explicit
+about what that does and doesn't mean now that this step has looked more
+closely. **That clean separation is a property of how much noise Step
+2's generator currently injects, not a validated real-world performance
+number.** Two results from this step make that concrete:
+- The full 250,000-pair evaluation (which Step 5 didn't originally run)
+  already surfaces a real 0.9185 precision at a plausible threshold, not
+  1.0 — imperfection was there all along, just invisible in the curated
+  500-pair comparison, which was built for clarity, not statistical
+  representativeness.
+- The last-name-length breakdown shows the two hardest cases still barely
+  clear the bar, papered over by DOB and other fields being clean on
+  those specific pairs. A dataset with harder, more compounding noise
+  (multiple noisy fields stacking on the same pair more often, a wider
+  variety of typo/OCR/mishearing patterns, realistic address collisions
+  per the diagnostic above) would likely show a real, currently-invisible
+  precision/recall trade-off region rather than the near-total separation
+  reported so far.
+
+**Bottom line: treat every precision/recall number in this project so far
+as "how this pipeline performs on deliberately illustrative synthetic
+noise," not as a production-readiness claim.** Before trusting these
+numbers for anything beyond learning the mechanics, the generator needs a
+revision pass adding: realistic non-match address collisions (per the
+diagnostic above), last-name noise that also affects the first letter
+more often (to stress-test the phonetic-code weakness directly), and
+compounding multi-field noise on a higher fraction of true matches.
+
 ## Open questions / things to decide next
 
-- Pick and justify a decision threshold on `match_probability` (e.g. "call
-  it a match above 0.5, send anything from 0.01-0.5 for manual review")
-  now that Tier 3 produces a real score — Tier 1's near-perfect precision
-  plus Tier 3's probabilities is roughly the two-tier structure a real
-  system would ship.
+- Add term-frequency adjustments to Tier 3's name comparisons (Splink
+  supports this; `cl.NameComparison` already sets up the metadata) — the
+  full-population evaluation's worst false positive ("James Smith" vs.
+  "James Smith") is a direct, concrete case for it.
+- Revise the Step 2 generator to add: realistic non-match address
+  collisions (shared family/apartment/generic addresses), last-name noise
+  that more often corrupts the first letter (to properly stress-test the
+  Soundex/NYSIIS weakness), and a higher rate of multiple noisy fields
+  compounding on the same true-match pair.
+- Pick and justify a decision threshold on `match_probability` for
+  production use once the above revisions make the precision/recall
+  trade-off more realistic — right now 0.5 looks attractive mostly
+  because the synthetic separation is unrealistically clean.
 - `last_name`'s "Jaro-Winkler distance >= 0.7" level never got enough
   training examples in either EM round to learn an m probability (Splink
   falls back to a default) — a third EM round with a different blocking

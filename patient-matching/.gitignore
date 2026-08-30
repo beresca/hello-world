@@ -11,14 +11,16 @@ __pycache__/
 .vscode/
 
 # Local scratch data - real EMS/hospital data is sensitive (PHI) and should
-# never be committed. Files explicitly named "synthetic_*" or "splink_*" are
-# fake data we generated ourselves, or derived outputs/model configs from
-# it, and are safe/intended to commit -- EXCEPT the full 500x500 cross-join
-# prediction file, which is ~56MB and fully reproducible by re-running
-# src/probabilistic_matcher.py, so it isn't worth permanently bloating the
-# repo with.
+# never be committed. Files explicitly named "synthetic_*", "splink_*", or
+# "evaluation_*" are fake data we generated ourselves, or derived
+# outputs/model configs/evaluation results from it, and are safe/intended
+# to commit -- EXCEPT the full 500x500 cross-join prediction file, which is
+# ~56MB and fully reproducible by re-running src/probabilistic_matcher.py
+# (or src/evaluate_matching.py, which regenerates it in-memory), so it
+# isn't worth permanently bloating the repo with.
 data/*
 !data/.gitkeep
 !data/synthetic_*.csv
 !data/splink_*
+!data/evaluation_*.csv
 data/splink_predictions_full_cross_join.csv
