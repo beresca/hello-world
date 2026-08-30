@@ -1,0 +1,17 @@
+# Python virtual environment (never commit this - it's big and machine-specific;
+# anyone can rebuild it from requirements.txt)
+.venv/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Common editor/OS clutter
+.DS_Store
+.vscode/
+
+# Local scratch data - real EMS/hospital data is sensitive (PHI) and should
+# never be committed. Synthetic/generated data we intentionally keep can be
+# added with `git add -f` if needed.
+data/*
+!data/.gitkeep
