@@ -1294,6 +1294,128 @@ inside a larger system. But it is only one component.
   types under one identity), combining automated statistical flags with
   operational and clinical feedback channels.
 
+## Step 9: resolved rate — review-queue problem vs. real ceiling (2026-08-30)
+
+### What this answers
+
+Step 7 picked one operating policy (auto-match ≥0.995, review down to
+0.015, reject below that) and showed it loses zero true matches on this
+evaluation. This step asks the sharper follow-up: when the numbers *do*
+fall short of 100%, is that because pairs are sitting in a review queue a
+human could still resolve (a tunable cost — more review capacity, more
+automation risk tolerance), or because a true match scored so low that no
+reasonable threshold could route it anywhere a human would ever look (a
+real ceiling — nothing about *where we draw the lines* fixes that, only
+better features or an outside data source would).
+
+`src/resolved_rate_analysis.py` runs the trained Step 5-7 model and
+thresholds against the full, realistic 500×500 = 250,000-pair cross-join
+(same population as Steps 6-7, regenerated fresh rather than trusting a
+stale local file — see Step 5's note on why).
+
+### 1-4. The current policy (auto-match ≥0.995, review floor 0.015)
+
+```
+Auto-match:    0.0972% of all pairs   (n=243)   243 true matches, 0 false positives  — precision 1.0000
+Review queue:  0.1248% of all pairs   (n=312)     7 true matches, 305 non-matches    — true-match prevalence 2.24%
+Auto-reject:  99.7780% of all pairs   (n=249,445)  0 true matches missed             — CEILING LOSS = 0
+```
+
+- **Review-queue composition (#2):** of the 312 pairs sent to review,
+  **2.24% (7/312) are true matches.** That's the realistic picture of what
+  a reviewer's queue looks like — mostly obvious non-matches that
+  happened to clear a low bar, with a small number of genuine matches
+  mixed in that the model wasn't confident enough to auto-match. This
+  number is the direct cost of the review process: a reviewer works
+  through roughly 44 non-matches for every real match they confirm.
+- **Ceiling loss (#3):** **zero** true matches are missed entirely at
+  the current review floor. This isn't a coincidence — Step 7 chose 0.015
+  *specifically* as the lowest score any true match ever received in this
+  evaluation, so by construction nothing currently falls below it.
+- **Resolved rate (#4):** `(auto-match true matches + review-queue true
+  matches) / total true matches` = `(243 + 7) / 250` = **100.0%**. Under
+  the current policy, and assuming a competent reviewer correctly
+  resolves every item handed to them, every true match in this evaluation
+  is reachable by the system somewhere — automatically or via review.
+
+### 5. Alternate thresholds: two different levers, two different effects
+
+This is the central finding of this step. There are two independent
+knobs, and they don't do the same thing:
+
+**Sweeping the auto-match threshold (review floor held at 0.015):**
+
+| Auto-match threshold | Auto-match precision | Resolved rate | Ceiling loss |
+|---|---|---|---|
+| 0.995 (current) | 1.0000 | 1.0000 | 0.0000 |
+| 0.99 | 0.9919 | 1.0000 | 0.0000 |
+| 0.9 | 0.9612 | 1.0000 | 0.0000 |
+| 0.5 | 0.9185 | 1.0000 | 0.0000 |
+
+**Precision degrades steadily and visibly as the auto-match threshold
+drops** — exactly the tradeoff Step 7 described (going from 0 false
+positives at 0.995 to 22 at 0.5). But **the resolved rate never moves —
+it stays at 100% no matter where the auto-match line is drawn**, as long
+as the review floor stays fixed. That's not a coincidence either: moving
+the auto-match threshold only reassigns pairs *between* "auto-matched"
+and "sent to review" — every true match above the review floor ends up
+resolved either way, just with a different amount of human effort and a
+different false-merge risk. **The entire gap between "0.995 gets 97.2% of
+matches auto-matched" and "100% of matches resolved" is a review-queue
+problem, not a ceiling** — solvable purely by deciding how much manual
+review effort and false-merge risk to accept, with no data loss either
+way.
+
+**Sweeping the review floor instead (auto-match held at 0.995) — this is
+where an actual ceiling appears:**
+
+| Review floor | Review queue size | Resolved rate | Ceiling loss (true matches missed) |
+|---|---|---|---|
+| 0.015 (current) | 312 | 1.0000 | 0 |
+| 0.05 | 92 | 0.9960 | 1 |
+| 0.1 | 74 | 0.9920 | 2 |
+| 0.5 | 27 | 0.9920 | 2 |
+
+Raising the floor shrinks the review queue (fewer obvious non-matches to
+wade through) but starts **silently losing real matches** — first the
+`P00234` "Liu"→"iu" pair (probability 0.0178, lost once the floor passes
+0.05), then the "Berry"→"erry" pair from Step 5 (probability 0.0605, lost
+once the floor passes 0.1). Past a floor of 0.1, raising it further (all
+the way to 0.5) doesn't lose any *more* matches on this evaluation — the
+next-lowest true match sits far above that, around 0.88 — so **the
+ceiling on this dataset is exactly these same two hard cases already
+flagged in Steps 4.5, 5, and 6**: real matches with several fields
+disagreeing at once, where a dropped first letter breaks both the
+name-similarity score and its own phonetic code.
+
+### Separating the two kinds of gap
+
+**Review-queue / threshold problem (movable, no data loss, purely a cost
+decision):** everything about *where the auto-match line sits* between
+the review floor and 1.0. This governs precision and how much manual
+review work the auto-match/review split creates, but at a fixed, low-enough
+review floor, it costs zero resolved matches — only automation
+convenience and false-merge risk.
+
+**Real ceiling (not movable by choosing different thresholds):**
+everything about *how low the review floor has to go* to catch every
+true match, and what that costs in review-queue noise. On this
+evaluation, catching the two hardest true matches (the short-name,
+multi-field-disagreement cases) requires a floor down around 0.015 — and
+at that floor, the review queue is already only 2.24% true matches. A
+*harder* real-world case (a true match scoring even lower than 0.0178)
+would require an even lower floor, and at some point the review queue
+would grow large enough, with a low enough true-match prevalence, that no
+threshold choice could rescue it — that pair would need a better feature
+(a stronger name-similarity technique for short strings, a referential
+data source to disambiguate, term-frequency weighting per Step 6) to ever
+score high enough to reach a sane review floor in the first place. **No
+threshold decision fixes a ceiling case — only better evidence does.**
+The current dataset's ceiling happens to be zero at a workable floor, but
+that's a property of how mild Step 2's noise still is (per Step 6's
+caveat), not a guarantee that stays true against harder real-world
+noise.
+
 ## Open questions / things to decide next
 
 - Get the NEMSIS/HL7 field mapping in Step 8 validated against the

@@ -24,4 +24,5 @@ data/*
 !data/splink_*
 !data/evaluation_*.csv
 !data/threshold_*.csv
+!data/resolved_rate_*.csv
 data/splink_predictions_full_cross_join.csv
