@@ -851,8 +851,118 @@ diagnostic above), last-name noise that also affects the first letter
 more often (to stress-test the phonetic-code weakness directly), and
 compounding multi-field noise on a higher fraction of true matches.
 
+## Step 7: operating thresholds — auto-match / review / reject (2026-08-30)
+
+### The decision
+
+`src/threshold_analysis.py` computes precision and recall across every
+possible `match_probability` cutoff (via
+`sklearn.metrics.precision_recall_curve`) on the full, realistic 250,000-
+pair cross-join, and sets a **three-way policy** rather than a single
+threshold:
+
+```
+match_probability >= 0.995              -> AUTO-MATCH (no human review)
+0.015 <= match_probability < 0.995      -> MANUAL REVIEW QUEUE
+match_probability < 0.015               -> AUTO-REJECT (treated as non-match)
+```
+
+Full precision/recall-vs-threshold chart (log-odds x-axis, both cutoffs
+marked): https://claude.ai/code/artifact/a2b0421c-3985-4588-8fde-c41a70ca55e2
+
+**A single cutoff forces every pair into "confident yes" or "confident
+no," with no room for genuine uncertainty.** Given the framing from Step
+6 — a false-positive *merge* (combining two different patients' records)
+is the costly error, meaningfully worse than a record that just needs a
+person to glance at it — the review band exists to absorb exactly that
+uncertainty instead of forcing a bad guess either direction.
+
+### Why 0.995 and 0.015, specifically
+
+Both numbers come directly from the full 250,000-pair evaluation, not
+round-number guessing:
+
+- **Auto-match threshold = 0.995** is the *lowest* probability in the
+  entire evaluation that produces **zero observed false positives** —
+  the most conservative cut point the data actually supports. It
+  auto-matches 243 of the 250 true matches with a perfect 243/243
+  precision record; the other 7 true matches (2.8%) fall just short and
+  go to manual review instead of being auto-matched. Lowering this
+  threshold would auto-match more true matches automatically, but the
+  curve shows exactly what that costs: at 0.9, precision drops to
+  0.9612 (10 false merges among 258 auto-matched pairs); at 0.5, precision
+  is only 0.9185 (22 false merges). Given the stated priority, trading
+  a small amount of automation for a verified-zero false-merge rate on
+  this evaluation is the deliberate choice being made here — see the
+  caveat below on what "verified-zero" should and shouldn't be taken to
+  mean.
+- **Review floor = 0.015** is set just below 0.0178 — the lowest
+  probability any true match ever received in this entire evaluation
+  (the "Liu"→"iu" pair tracked since Step 4.5). Anything scoring below
+  this is auto-rejected with no human ever seeing it, so this floor is
+  chosen specifically so that **zero true matches are ever silently
+  discarded** — every real match in this evaluation clears it into at
+  least the review queue.
+
+### What this policy produces on the full 250,000-pair evaluation
+
+| Band | n | true matches | non-matches |
+|---|---|---|---|
+| Auto-match (≥0.995) | 243 | 243 | 0 |
+| Review queue [0.015, 0.995) | 312 | 7 | 305 |
+| Auto-reject (<0.015) | 249,445 | 0 | 249,445 |
+
+- Auto-match precision: **100%** (243/243) on this evaluation.
+- 97.2% of all true matches get auto-matched; the remaining 2.8% go to
+  review, none are silently lost.
+- The review queue is small relative to the whole population — **0.125%
+  of all 250,000 candidate pairs** (312 of them) — and is where a human
+  actually has to look, at a ratio of roughly 1 real match for every 44
+  non-matches in that queue.
+
+### This is a business tradeoff — the deliberate alternative framing
+
+Two things a reader should be able to redo with different priorities:
+
+- **Lowering the auto-match threshold to 0.9** would auto-match all 250
+  true matches with zero misses at the auto-match stage, but would also
+  auto-match **10 real non-matches** as if they were confirmed — the
+  exact false-merge risk this recommendation exists to avoid. That's a
+  legitimate choice if false merges are cheaper to detect/undo downstream
+  than this project assumes, or if review-team capacity is the binding
+  constraint instead.
+- **Raising the review floor** would shrink the review queue further
+  (less staff time spent on obvious non-matches) but risks pushing a
+  genuine match below the floor where nobody ever looks at it again —
+  a silent miss rather than a caught, correctable one.
+
+Whether spending 2.8% of true matches' worth of manual review time to
+guarantee zero known false merges is the right trade is a call about
+review-team capacity and the real-world cost of a bad merge versus a
+missed one. That's not something this analysis can settle — it's flagged
+here explicitly so the choice was made on purpose, not defaulted into.
+
+### Caveat this decision inherits from Step 6
+
+The "zero false positives" and "100% precision" figures above describe
+this specific synthetic evaluation, not a real-world guarantee — Step 6
+already flagged that the near-total separation in this dataset likely
+reflects insufficient/unrealistic noise (no non-match address collisions,
+no common-name term-frequency weighting, limited compounding multi-field
+noise) rather than genuine 100% reliability. **Once the generator
+revisions listed in Step 6 land, re-run `threshold_analysis.py` and
+expect these exact numbers to move** — probably requiring a stricter
+(higher) auto-match threshold to keep the same zero-false-positive
+guarantee against harder, more realistic noise. Treat 0.995/0.015 as a
+first, defensible operating point on the evidence available today, not a
+constant to hard-code and forget.
+
 ## Open questions / things to decide next
 
+- Re-run `src/threshold_analysis.py` after the Step 6 generator revisions
+  (realistic address collisions, term-frequency adjustment, more
+  compounding noise) land, and expect the 0.995/0.015 operating
+  thresholds to need re-justifying against a harder evaluation.
 - Add term-frequency adjustments to Tier 3's name comparisons (Splink
   supports this; `cl.NameComparison` already sets up the metadata) — the
   full-population evaluation's worst false positive ("James Smith" vs.
@@ -862,10 +972,6 @@ compounding multi-field noise on a higher fraction of true matches.
   that more often corrupts the first letter (to properly stress-test the
   Soundex/NYSIIS weakness), and a higher rate of multiple noisy fields
   compounding on the same true-match pair.
-- Pick and justify a decision threshold on `match_probability` for
-  production use once the above revisions make the precision/recall
-  trade-off more realistic — right now 0.5 looks attractive mostly
-  because the synthetic separation is unrealistically clean.
 - `last_name`'s "Jaro-Winkler distance >= 0.7" level never got enough
   training examples in either EM round to learn an m probability (Splink
   falls back to a default) — a third EM round with a different blocking
