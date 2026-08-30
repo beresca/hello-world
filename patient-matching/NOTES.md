@@ -957,8 +957,359 @@ guarantee against harder, more realistic noise. Treat 0.995/0.015 as a
 first, defensible operating point on the evidence available today, not a
 constant to hard-code and forget.
 
+## Step 8: Path forward — from prototype to production (2026-08-30)
+
+This section is written to stand on its own — something to hand to an
+engineering team, or to re-read before starting the next phase, without
+needing to have followed Steps 1-7 in detail. It consolidates what we
+learned building the prototype into six practical areas: how our fields
+map to the real data standards, what changes once real data is involved,
+how ground truth stops being something we invented, where the prototype
+is known to fall short, what scale actually costs, and how this pairwise
+scorer relates to a real production Master Patient Index system.
+
+**No new matching code was written for this step** — this is
+consolidation and planning only.
+
+### 1. Field mapping: synthetic schema → NEMSIS, HL7 ADT, USCDI
+
+Our synthetic fields (Step 3.5) were already named to match USCDI's
+*Patient Demographics/Information* data class. The table below extends
+that into the two real source-system standards this project is ultimately
+meant to connect: **NEMSIS** (the national EMS/ePCR data standard) on the
+EMS side, and **HL7 v2 ADT** (the near-universal hospital
+admission/discharge/transfer messaging standard) on the hospital side.
+
+| Our field | USCDI element | NEMSIS v3 (ePCR) — section/concept | HL7 v2 ADT — PID segment |
+|---|---|---|---|
+| `first_name` | First Name | `ePatient` — patient's first name | PID-5.2 (Given Name) |
+| `middle_name` | Middle Name | `ePatient` — middle name/initial | PID-5.3 (Middle Name) |
+| `last_name` | Last Name | `ePatient` — patient's last name | PID-5.1 (Family Name) |
+| `suffix` | Suffix | `ePatient` — name suffix, if captured | PID-5.4 (Suffix) |
+| `previous_name` | Previous Name | not a standard ePCR element (see gap below) | PID-5 repeated with a maiden/previous name-type code, or PID-6 (Mother's Maiden Name) as a narrower proxy |
+| `date_of_birth` | Date of Birth | `ePatient` — date of birth | PID-7 |
+| `birth_sex` | Birth Sex | `ePatient` — patient's sex/gender | PID-8 (Administrative Sex) |
+| `race` | Race | `ePatient` — race | PID-10 |
+| `ethnicity` | Ethnicity | `ePatient` — ethnicity | PID-22 (Ethnic Group) |
+| `address` | Address | `ePatient` — patient's home address (**a separate concept from `eScene`'s incident location** — see below) | PID-11 |
+| `phone_number` | Phone Number | `ePatient` — contact phone, if captured | PID-13 (Phone Number – Home) |
+| `email_address` | Email Address | not a standard ePCR element (see gap below) | not standard in v2 PID; lives in HL7 FHIR's `Patient.telecom` if the hospital is on FHIR |
+| `patient_identifier_mrn` | *(not a USCDI demographic element — administrative identifier, deliberately, per Step 3.5)* | not a native ePCR element; only present if a crew ad hoc captured it off an insurance/ID card | PID-3 (Patient Identifier List), under the hospital's own assigning authority |
+
+**Caveat:** the NEMSIS column above is conceptual (which section/entity a
+field lives in), not exact element IDs — those vary between NEMSIS
+versions (v3.4, v3.5, etc.) and should be checked against the current
+NEMSIS Data Dictionary/XSD before building a real interface, not taken
+from this document as authoritative.
+
+**One mapping finding worth acting on directly:** NEMSIS actually keeps
+the incident/scene location (`eScene`) and the patient's home address
+(`ePatient`) as **separate elements** — a real ePCR can capture both.
+Our synthetic generator collapsed this distinction into one `address`
+field that's ambiguously "sometimes home, sometimes scene" (Step 2's 40%
+scene-address noise). A real integration should prefer `ePatient`'s home
+address specifically for matching against the hospital's `PID-11`, only
+falling back to `eScene`'s incident location when home address wasn't
+captured — which means a well-built real pipeline may have *less* address
+ambiguity than our synthetic model assumed, provided it sources the right
+NEMSIS field rather than whatever's easiest to export.
+
+**HL7 also has a standard event for a concept this project needs later**
+(see section 6): the **A40 "Merge Patient"** ADT message type, which
+hospital systems already use to broadcast a patient-identity merge to
+downstream consumers. Worth knowing this exists now, even though nothing
+in the current prototype produces or consumes it yet.
+
+### 2. What changes once this touches real (de-identified) pilot data
+
+Everything in this project so far has run on Faker-generated synthetic
+data with no real person behind any of it, on a local machine, in a
+personal git repo. None of that is true anymore once pilot data — even
+de-identified pilot data — enters the picture. This is a practical,
+technical framing, not a legal or compliance review; involve actual
+privacy/compliance/legal counsel before any real data (de-identified or
+not) touches this system.
+
+**Access controls**
+- Role-based access, least privilege: "can run the matcher" and "can view
+  raw demographic fields in a review-queue UI" should be different
+  permissions, not bundled together by default.
+- Environment segregation: pilot data should live in its own controlled
+  environment, never mixed into the dev/test setup this prototype used —
+  synthetic stays synthetic; a real credential, connection string, or
+  data export should never be reachable from a local dev laptop the way
+  `.venv` and CSV files were here.
+- Proper secrets management for any real data-source connection (database
+  credentials, API keys) — not the "just run it locally" model this
+  prototype used throughout.
+
+**Storage**
+- Encryption at rest and in transit for anything derived from pilot data,
+  including intermediate files (our prototype's habit of writing plain
+  CSVs to a `data/` folder is fine for Faker output, not for anything
+  real).
+- A defined retention/deletion policy — how long raw records, match
+  scores, and review decisions are kept, and a real process for deleting
+  them on schedule or on request.
+- Data minimization: does the matching pipeline need the full free-text
+  address forever, or only for as long as it takes to score a pair? Some
+  components (e.g., audit logs, long-term evaluation datasets) may only
+  need to retain match decisions and outcomes, not the underlying PHI.
+- Backups protected at the same level as primary storage — a backup isn't
+  a lesser copy from a privacy standpoint.
+
+**Audit logging**
+- Every access to a real record, every match decision (auto-match, sent
+  to review, rejected) and every human reviewer action needs to be logged
+  immutably: who, when, what, and on what evidence. This is required for
+  HIPAA's audit-control expectations even in a pilot, and separately
+  matters operationally — if a merge turns out wrong later (see section
+  6), the audit trail is what makes it possible to find out how it
+  happened and undo it safely.
+- Worth naming the underlying tension explicitly in any privacy/IRB
+  review for the pilot: a matching system that works well is, by design,
+  *re-linking* records that a de-identification process tried to keep
+  apart. "The pilot data is de-identified" does not by itself resolve
+  the privacy question this system raises — that needs its own explicit
+  sign-off, not an assumption.
+- Code or threshold changes that affect real match decisions (like the
+  0.995/0.015 cutoffs from Step 7) should go through the same kind of
+  review a change affecting patient safety would, not a casual edit.
+
+### 3. From synthetic ground truth to real ground truth
+
+Every evaluation number in Steps 3-7 exists because we invented
+`is_match` alongside the data — we know the answer because we generated
+it. Production has no such column. Here's where real ground truth
+actually comes from, and how it should be used differently than our
+synthetic label was.
+
+**The review queue is the real ground-truth source.** Every time a human
+resolves a Step 7 review-queue item (confirms it's a match, rejects it,
+or asks for more information and later resolves it), that decision is a
+real, labeled data point — the closest production analog to our synthetic
+`is_match`. Over time this accumulates into a genuine labeled dataset.
+
+**What that unlocks, once there's enough of it:**
+- Splink supports training directly from labeled pairs, not only EM —
+  once real labels exist, at least the higher-confidence portion of
+  m-probability estimation should move off the EM approximation Step 5
+  used (EM was always a stand-in for "we don't have labels yet," not the
+  intended long-term approach).
+- Re-running Step 6/7's evaluation harness on real reviewed outcomes
+  instead of synthetic ones — this is the point at which the project
+  finds out whether the 0.995/0.015 thresholds (calibrated against
+  synthetic separation Step 6 already flagged as too clean) hold up, or
+  need to move.
+- Ongoing model recalibration on a defined cadence (see section 5) as
+  real-world data drifts — new EMS documentation software, a new
+  facility joining the pilot, a shift in patient population.
+
+**Guardrails this process needs, not just the happy path:**
+- **A held-out gold set.** Don't fold every single reviewed pair straight
+  back into retraining — set some aside as a fixed evaluation set, the
+  same way Steps 3-7 used a fixed synthetic set, so evaluation doesn't
+  become circular (a model that's only ever tested against the same data
+  it was tuned on will look better than it is).
+- **Reviewer quality control.** A human review decision is an
+  approximation of ground truth too, not a guarantee — occasional
+  double-review of the same item, and tracking reviewer-level agreement
+  against a known-good gold set, catches drift or inconsistency in the
+  human side of the loop.
+- **Monitoring the bands nobody double-checks by default.** The
+  auto-match band should be periodically spot-checked even though it
+  skipped review by design, to confirm real-world precision still holds.
+  The auto-reject band is harder — nobody looks at it by construction —
+  so it needs its own periodic sampling strategy or a way for a missed
+  match to surface later (e.g., a downstream duplicate-detection pass,
+  section 6).
+- **A defined cold-start plan.** At pilot launch, before enough real
+  reviewed pairs exist, the system runs on thresholds calibrated against
+  synthetic data with known caveats (Step 6/7) — decide up front roughly
+  how much real reviewed volume (or how much time) triggers the first
+  real recalibration, rather than leaving that transition undefined.
+
+### 4. Known gaps and simplifications in the current prototype
+
+Consolidated from what Steps 2-7 already found, organized by category —
+see the referenced step for full detail on any item.
+
+**Data generation realism** (Steps 2, 4.5, 6): noise probabilities are
+illustrative guesses, not measured from real ePCR/EHR error rates; no
+non-match address or common-name collisions were modeled, which Step 6
+showed measurably inflates how strong the address and exact-name
+evidence look; last-name corruption isn't weighted toward the first
+letter, which is specifically where the phonetic-matching weakness lives
+(Step 4.5's "Liu"→"iu"); noise events don't compound (one corruption per
+field per record, not the multi-error chaos real rushed documentation
+produces); no person appears more than once per source, so the prototype
+has never had to handle repeat visits or repeat ambulance runs; address
+stayed one free-text field rather than USCDI's structured sub-elements.
+
+**Matching model** (Step 5, 6): only one strong identifier (MRN) is
+modeled — no SSN or other secondary identifier; MRN presence is modeled
+as a simple present/wrong binary rather than the fuller range of
+real-world capture errors; one comparison level (`last_name`'s
+Jaro-Winkler ≥0.7 band) never got enough training data to learn an m
+probability; no term-frequency adjustment for common names, which Step
+6's worst false positive ("James Smith" vs. "James Smith") argues for
+directly; every comparison so far has been strictly pairwise — nothing
+in the prototype resolves N:M relationships (one person, many records
+across many visits), which a real system has to handle constantly.
+
+**Evaluation** (Step 6, 7): every precision/recall number in this project
+is measured against our own synthetic ground truth, not real reviewed
+outcomes; the near-total separation reported in Step 5 was already
+flagged as reflecting synthetic noise limitations, not validated
+real-world reliability; there has been no reviewer-in-the-loop testing of
+any kind yet.
+
+**Engineering/operational**: everything so far is one-shot Python scripts
+reading and writing CSV files — there's no persistence layer, no
+service/API interface, no logging or monitoring infrastructure, no
+incremental or streaming processing (every run reprocesses the full
+dataset from scratch), no model versioning beyond a single JSON snapshot
+(`data/splink_trained_model.json`), and nothing to detect or handle a
+source system changing its export format underneath the pipeline.
+
+### 5. Scale and cost
+
+**Cross-join vs. blocking.** Every step so far scored the full cartesian
+product — every EMS record against every EHR record (500 × 500 = 250,000
+comparisons), sub-second on a laptop. That approach is quadratic and does
+not survive contact with real volume: a modest regional system with
+200,000 annual EMS runs and 2,000,000 annual hospital encounters would
+need 400 billion comparisons for a full cross-join — computationally
+infeasible, not just slow. **Blocking** is the standard fix: only
+generate candidate pairs that share some cheap-to-check property first
+(e.g., same birth year, same first three letters of last name), which cuts
+the comparison space by orders of magnitude. This project actually has an
+unusually strong, domain-specific blocking rule available that generic
+record linkage doesn't: **a temporal window**. An EMS incident and the
+hospital encounter it produced happen close together in time — an
+ambulance transport is followed by an ED registration within hours, not
+years — so blocking candidate EHR records to a window around the EMS
+incident timestamp (same day, or a defined hour range, scoped to
+facilities the unit could plausibly have transported to) can shrink the
+candidate pool by orders of magnitude with very little risk of excluding
+a real match. Note this is a *different* concept from the blocking rules
+Step 5 used for EM training (which controlled what data taught the model
+its weights) — production blocking controls what candidate pairs get
+generated at prediction time at all, and needs its own validation: a
+blocking rule that's too aggressive silently drops true matches before
+the model ever sees them, a failure mode nothing in this project has
+tested for yet.
+
+**Real-time matching speed is largely independent of organization size.**
+Once a model's weights are trained, scoring one new incoming record means
+applying blocking to find a small candidate set, then scoring just those
+— and a well-designed blocking window (e.g., "who was registered today")
+stays roughly constant in size regardless of how much historical data the
+organization has accumulated. A large academic medical center and a small
+rural hospital both reduce to "compare against today's cohort," a
+similarly bounded operation — the bigger system just has a modestly
+larger (still blocking-bounded) candidate pool per record, not a
+different computational regime. This is what makes real-time,
+per-record matching scale to organizations of very different sizes
+without redesigning the approach — provided blocking is actually built
+(see above; this prototype has never needed it, at 500 records total).
+
+**Periodic model retraining cost DOES scale with data volume.**
+Re-estimating m/u probabilities — via EM today, via real labeled data per
+section 3 eventually — is a batch operation over a large, representative
+slice of historical data, and that genuinely gets more expensive as an
+organization's total record volume grows: more compute time, more
+memory, more infrastructure to provision for the job, and a real cadence
+to define (quarterly? triggered by detected drift — a new documentation
+system, a new facility joining, a shifting patient population?). This is
+a scheduled, offline cost, fundamentally different in shape from the
+real-time path above. For planning purposes these are two separate
+capacity conversations: budget real-time infrastructure around *peak
+daily comparison volume after blocking* (roughly constant per
+organization), and budget retraining infrastructure around *total
+historical data volume* (grows over time) — conflating the two will
+produce the wrong cost estimate for one of them.
+
+### 6. From this pairwise matcher to a true EMPI
+
+An **EMPI (Enterprise Master Patient Index)** is the real production
+system this project is a piece of, not the whole of. Being explicit about
+which part we've built and which parts remain matters for planning the
+next phase honestly.
+
+**What we've built is the decision engine.** Tiers 1-3 (Steps 3, 5-7) —
+given two candidate records, produce a probability that they're the same
+person, and a policy for what to do with that probability — is genuinely
+the hardest *intellectual* part of an EMPI, and it's reusable as-is
+inside a larger system. But it is only one component.
+
+**What's genuinely new, not an extension of what exists:**
+
+- **A persistent identity store.** Nothing in this prototype remembers
+  anything between runs — every run is a stateless, one-shot comparison
+  between two static tables. A real EMPI maintains a durable "Enterprise
+  ID" (EID) for every known real-world person, plus a cross-reference
+  table mapping every source-system record (every ePCR, every hospital
+  MRN, potentially across multiple facilities) to that EID. New records
+  need to be matched against this continuously growing, continuously
+  updated population — a fundamentally different access pattern than
+  loading two fixed CSVs and cross-joining them.
+- **Survivorship rules.** When two source records get linked under one
+  EID and their fields disagree (hospital record says address A, EMS
+  record says address B), something has to decide which value is the
+  person's "current" or "best" one on the composite record. This needs
+  explicit business rules — most-recent-wins, most-authoritative-source-
+  wins, field-specific logic (a DOB disagreement between linked records
+  shouldn't be silently overwritten; it's a data-quality signal worth
+  surfacing, not resolving quietly). Nothing in this project has ever
+  needed to answer "what does the composite record actually look like,"
+  only "are these the same."
+- **Merge and unmerge, with an audit trail.** Real EMPIs need to merge
+  identities (via this matcher's auto-match, a reviewer's decision, or a
+  later-discovered connection) *and* safely unmerge when a merge turns
+  out wrong — without losing data or breaking anything downstream that
+  already consumed the now-incorrect merged view. HL7 v2's **A40 "Merge
+  Patient" event** (section 1) is the standard mechanism hospital systems
+  already use to broadcast this; a real EMPI needs to both produce and
+  consume these, backed by the durable, append-only audit log described
+  in section 2.
+- **Incremental processing.** This prototype reprocesses everything from
+  scratch every run. A real EMPI matches one new record at a time as it
+  arrives (a new ePCR, a new ADT admit message) against the existing
+  identity store, in near-real-time — an event-driven processing model,
+  not a batch cross-join.
+- **Duplicate and overlay monitoring.** Two distinct, ongoing background
+  problems, both different from anything this prototype does:
+  **duplicate detection** — the same real person accidentally ending up
+  under two different EIDs over time (matched imperfectly on separate
+  occasions) — needs a periodic re-scan of the identity store *against
+  itself*, which is actually the same scoring engine applied to a
+  different candidate-pair source (EID vs. EID instead of new record vs.
+  store). **Overlay monitoring** is the opposite failure — a single EID
+  accidentally containing more than one real person's records, from a
+  false-positive merge — and needs its own detection strategy: watching
+  for internal inconsistencies within one EID's linked records over time
+  (conflicting demographics survivorship rules can't reconcile, or a
+  downstream clinical system flagging something like two different blood
+  types under one identity), combining automated statistical flags with
+  operational and clinical feedback channels.
+
 ## Open questions / things to decide next
 
+- Get the NEMSIS/HL7 field mapping in Step 8 validated against the
+  current NEMSIS Data Dictionary/XSD and the pilot hospital's actual PID
+  segment usage — this document's mapping is conceptual, not verified
+  against a live interface.
+- Engage privacy/compliance/legal before any real (even de-identified)
+  pilot data touches this system — Step 8 section 2 is a technical
+  framing, not a substitute for that review.
+- Design and validate production blocking rules (Step 8 section 5),
+  including measuring *blocking recall* (does the blocking rule ever
+  silently exclude a true match before the model sees it?) — nothing in
+  this project has needed blocking at its current 500-record scale.
+- Define the cold-start-to-recalibration plan from Step 8 section 3
+  concretely (a real volume or time threshold), rather than leaving "when
+  do we trust real labels enough to retrain on them" open-ended.
 - Re-run `src/threshold_analysis.py` after the Step 6 generator revisions
   (realistic address collisions, term-frequency adjustment, more
   compounding noise) land, and expect the 0.995/0.015 operating
