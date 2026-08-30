@@ -319,12 +319,128 @@ none accidentally collided with the EHR MRN (the ID numbering ranges —
 100000s/200000s/300000s — make that structurally impossible, not just
 unlikely). The mechanism is intact; only the specific random draws changed.
 
+## Step 4: Similarity feature layer (2026-08-30)
+
+### What it is
+
+`src/similarity_features.py` computes, for every pair, a set of numeric
+similarity scores comparing the EMS and EHR demographic fields — the
+evidence a later decision layer (a threshold rule, then splink) will
+reason over for the pairs Tier 1 can't resolve on its own. It writes a
+new file, `data/synthetic_ems_ehr_pairs_features.csv`, containing the
+original columns plus the scores below plus `tier1_deterministic_match`
+(so the pairs Tier 1 already resolved are still identifiable, even though
+we compute scores for them too — see "why compute for every pair" below).
+We deliberately did **not** overwrite `synthetic_ems_ehr_pairs.csv` — that
+file stays the canonical raw generator output other scripts (like
+`deterministic_matcher.py`) depend on; this is a derived, feature-enriched
+copy.
+
+### The four techniques, and what each one measures
+
+**1. Name similarity — Jaro-Winkler (`first_name_similarity`,
+`last_name_similarity`)**
+A character-based edit-distance score from 0 (nothing alike) to 1
+(identical), computed via `rapidfuzz.distance.JaroWinkler`. Jaro-Winkler
+gives extra credit for a shared *prefix*, which fits how people actually
+misspell names — the first couple of letters are usually right, and the
+mistake is further in ("Timothhy" vs "Timothy", "Jaon" vs "Jason"). We
+compute it separately for first and last name (rather than one score on
+the full name) so a typo in one doesn't get diluted by an exact match in
+the other. Both strings are lowercased first so a capitalization
+difference between systems doesn't register as a spelling difference.
+
+**2. DOB similarity — custom component comparison (`dob_similarity`,
+`dob_match_type`)**
+A plain string-distance metric is a poor fit for dates: "1999-02-18" vs
+"1999-08-12" looks fairly similar as a string despite being an entirely
+different birthday. Instead, `compare_dob()` checks which parts
+(year/month/day) actually agree and scores accordingly — exact match
+(1.0), a day/month transposition like our generator's noise produces
+(0.85), same month & day but a different year, i.e. a misremembered birth
+year (0.7), and progressively weaker partial matches down to no shared
+components (0.0). A blank DOB on either side returns `NaN`/`"missing"`,
+never `0.0` — a missing field is an absence of evidence, not evidence of
+a mismatch, and conflating the two would make the feature actively
+misleading.
+
+**3. Address similarity — token-based comparison (`address_similarity`)**
+Uses `rapidfuzz.fuzz.token_sort_ratio`, which splits each address into
+words, sorts them, and compares — unlike Jaro-Winkler, this isn't thrown
+off by word reordering or extra tokens (apartment numbers, differently
+ordered city/state). This is the right tool for a multi-token string like
+an address, where Jaro-Winkler (built for short, single-token strings
+like names) would be the wrong fit. Important caveat: a low score here
+doesn't necessarily mean "different person" — the EMS scene address and
+the EHR home address can legitimately differ for the same real person.
+That ambiguity is exactly why this is one input among several, not a
+standalone decision.
+
+**4. Phonetic encoding — Soundex and NYSIIS on last name
+(`last_name_soundex_match`, `last_name_nysiis_match`)**
+Both algorithms collapse a name to a short code representing roughly how
+it *sounds*, catching spelling variants that look very different
+character-by-character but would be pronounced the same ("Smith" vs
+"Smyth" both Soundex to `S530`). Soundex is the older, simpler algorithm;
+NYSIIS is newer and generally more accurate for American names but uses
+different rules, so the two don't always agree — comparing both surfaces
+more signal than trusting either alone. Needed the `jellyfish` library for
+this (added to `requirements.txt`) since rapidfuzz does string-distance
+metrics, not phonetic encoding — a genuinely different technique family.
+
+### Sanity-check results
+
+Mean scores by ground truth label, across all 500 pairs:
+
+| | first_name_sim | last_name_sim | dob_sim | address_sim | soundex_match | nysiis_match |
+|---|---|---|---|---|---|---|
+| **true matches** | 0.971 | 1.000 | 0.950 | 0.795 | 1.000 | 1.000 |
+| **non-matches** | 0.398 | 0.375 | 0.008 | 0.377 | 0.004 | 0.004 |
+
+Clear separation on every feature — exactly what we'd want going into a
+threshold or probabilistic decision layer. Spot-checking individual true
+matches Tier 1 did *not* resolve (no shared MRN) confirms the scores
+behave sensibly even under the injected noise:
+
+- `Marria` / `Maria` → 0.961 name similarity (a typo, correctly scored as
+  "close").
+- DOB `2005-11-15` / `2007-11-15` → 0.7, labeled
+  `month_day_match_year_differs` (exactly the year-corruption noise from
+  Step 2, correctly recognized as strong partial evidence rather than a
+  flat "no match").
+- DOB `1966-06-21` / `1965-06-21` → also 0.7, same reasoning.
+- Exact matches on name/DOB/address (no noise landed on that particular
+  pair) correctly score 1.0 across the board.
+
+Non-match pairs show the opposite pattern: name similarities in the
+0.0–0.6 range (some accidental partial overlap is expected — e.g. "Karen"
+vs "Adam" scores 0.48 purely by character coincidence, which is a good
+reminder that any single fuzzy score can be misleading on its own), DOBs
+mostly `no_match` (0.0), and only 1 of 250 non-matches showing a
+coincidental phonetic collision (a real phenomenon: two unrelated people
+whose surnames happen to sound alike).
+
+### A known limitation this surfaced
+
+The `last_name_similarity`/phonetic features show **zero variation on
+true matches in this dataset** — every one of the 250 true matches has an
+exactly identical `last_name` on both sides, because the Step 2 noise
+generator only ever injects typos/nicknames into `first_name`, never
+`last_name`. That's a real gap in the synthetic data, not a bug in the
+new features: in reality, last names get misspelled too. Worth revisiting
+the generator later to add last-name noise, so these particular features
+actually get exercised the way they're meant to be.
+
 ## Open questions / things to decide next
 
-- Build Tier 2 (fuzzy matching with rapidfuzz on name/DOB/address) next,
-  to catch the true matches Tier 1 correctly leaves undecided — measure
-  its recall *and* watch for false positives, since fuzzy scoring is where
-  wrong-but-confident matches start becoming possible.
+- Build Tier 2's actual decision logic next (a threshold or weighted
+  combination over these similarity scores) to catch the true matches
+  Tier 1 correctly leaves undecided — measure recall *and* watch for
+  false positives, since this is where wrong-but-confident matches start
+  becoming possible.
+- Add last-name typo/nickname noise to the Step 2 generator so the
+  last-name similarity and phonetic features actually get exercised by
+  true matches (currently they show no variation — see limitation above).
 - Should we calibrate the noise probabilities (or the race/ethnicity
   population weights) against any published research, or is illustrative
   noise good enough for a learning prototype?
