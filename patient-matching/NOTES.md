@@ -224,15 +224,113 @@ exists to be the one part of the system you can trust unconditionally; any
 fuzziness belongs in a later, explicitly probabilistic tier where we can
 also quantify the uncertainty.
 
+## Step 3.5: Align schema to USCDI (2026-08-30)
+
+### What changed and why
+
+Before building the next matching tier, we renamed/restructured the
+synthetic dataset's fields to match **USCDI (United States Core Data for
+Interoperability)**'s *Patient Demographics/Information* data class — the
+standardized field set real EMS and hospital systems are expected to
+report. Reasoning: we're going to spend a lot more effort building
+matching logic *on top of* this schema, so it's worth paying the
+retrofit cost now, while it's cheap, rather than after Tier 2/3 logic is
+already wired to old field names.
+
+**Renamed** (old → new):
+| Old | New | Why |
+|---|---|---|
+| `sex` | `birth_sex` | matches USCDI's Birth Sex element name; values changed from `M`/`F` to `Male`/`Female` |
+| `dob` | `date_of_birth` | matches USCDI element name |
+| `phone` | `phone_number` | matches USCDI element name |
+| `mrn` | `patient_identifier_mrn` | see below — deliberately *not* named like a demographic field |
+
+**Added** (new fields, not previously in the dataset): `middle_name`,
+`suffix`, `previous_name`, `race`, `ethnicity`, `email_address` — all part
+of USCDI's Patient Demographics/Information element list.
+
+**Why the identifier is named/treated differently:** USCDI does not
+classify a medical record number as a demographic attribute — it's a
+local, hospital-issued administrative identifier, not something that
+describes the patient. Naming it `patient_identifier_mrn` (rather than,
+say, folding it in as just another demographic column) keeps that
+distinction visible in the schema itself: Tier 1 works on the identifier
+field, and every tier after this one will work on demographic fields —
+two genuinely different kinds of evidence, and the column names now say
+so rather than leaving it implicit.
+
+**Race/ethnicity value sets** follow the OMB (Office of Management and
+Budget) categories USCDI points to: `White`, `Black or African American`,
+`Asian`, `American Indian or Alaska Native`, `Native Hawaiian or Other
+Pacific Islander`, `Two or More Races` for race; `Hispanic or Latino` /
+`Not Hispanic or Latino` for ethnicity. Population weights used to
+generate these are illustrative guesses, not derived from real census
+data — fine for a learning prototype, not something to cite.
+
+**New fields follow the same "realistic capture gap" pattern as Step 2's
+noise, not brand-new mechanics:**
+- `previous_name` and `email_address` are **always blank on the EMS
+  side** — not probabilistic noise, but a structural fact: ePCR/NEMSIS-
+  based ambulance documentation generally has no field at all for a
+  patient's prior legal name or email address. The hospital side
+  populates both most of the time (with a small realistic gap — some
+  patients decline to give an email at registration).
+- `race`/`ethnicity` *are* real NEMSIS fields EMS crews do capture, but at
+  lower reliability than a hospital registration desk: our generator
+  blanks/marks them "Unknown" more often on the EMS side (blank 10% /
+  "Unknown" 25%) than the EHR side (blank 2% / "Unknown" 8%).
+- `middle_name`/`suffix` follow the existing "EMS abbreviates or drops
+  what the hospital records in full" pattern already used for other
+  fields.
+
+**Address stayed a single free-text field** (not split into
+street/city/state/zip components) — USCDI does define these as separate
+sub-elements, but the task only asked to align the field list, and a
+single string is enough for the similarity-scoring work ahead. Worth
+revisiting if we ever need field-level (not whole-address) comparison.
+
+### Re-verifying Tier 1 after the schema change
+
+Ran `.venv/bin/python src/generate_synthetic_data.py --n-pairs 500` to
+regenerate the dataset, then `.venv/bin/python src/deterministic_matcher.py`
+(updated to check `ems_patient_identifier_mrn` /
+`ehr_patient_identifier_mrn` instead of the old `ems_mrn`/`ehr_mrn`):
+
+```
+Pairs flagged as a match:     15
+  - correct (true positive):  15
+  - wrong (false positive):   0
+
+Recall on true matches:       6.0%
+Precision:                    100.0%
+```
+
+**Still 100% precision, zero false positives — Tier 1 passes.** Recall
+moved from 9.2% (Step 3) to 6.0% here; this is expected sampling
+variation, not a regression. The underlying rule generating an EMS-side
+MRN is still "10% chance, and always correct when present" — unchanged
+mechanically — but adding several new fields to `build_person`/
+`build_ems_record` shifted *when* each pseudo-random draw happens in the
+sequence, so the same seed produces a different specific set of "did this
+particular record get an MRN" outcomes. Verified directly: of the 250 true
+matches, exactly 15 got a non-blank EMS MRN, and all 15 equal the EHR MRN
+(0 mismatches); of the 250 non-matches, 22 got a non-blank EMS MRN and
+none accidentally collided with the EHR MRN (the ID numbering ranges —
+100000s/200000s/300000s — make that structurally impossible, not just
+unlikely). The mechanism is intact; only the specific random draws changed.
+
 ## Open questions / things to decide next
 
 - Build Tier 2 (fuzzy matching with rapidfuzz on name/DOB/address) next,
-  to catch the 227 true matches Tier 1 correctly leaves undecided — measure
+  to catch the true matches Tier 1 correctly leaves undecided — measure
   its recall *and* watch for false positives, since fuzzy scoring is where
   wrong-but-confident matches start becoming possible.
-- Should we calibrate the noise probabilities against any published
-  research on ePCR data quality, or is illustrative noise good enough for
-  a learning prototype?
+- Should we calibrate the noise probabilities (or the race/ethnicity
+  population weights) against any published research, or is illustrative
+  noise good enough for a learning prototype?
 - Do we eventually want a version of this generator that creates messier,
   larger-scale data (e.g. thousands of records, multiple visits per
   person) to stress-test performance, once the core matching logic works?
+- If we ever need field-level address comparison (street vs. city vs.
+  state), we'll need to split `address` into USCDI's component
+  sub-elements rather than comparing it as one free-text string.

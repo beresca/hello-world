@@ -35,8 +35,14 @@ import pandas as pd
 # matching on. Our synthetic dataset only has MRN, but writing this as a
 # list (rather than hard-coding a single column name everywhere) makes it
 # easy to add e.g. "ssn" later if the dataset grows one.
+#
+# Note this is deliberately NOT one of the USCDI demographic field names
+# (first_name, date_of_birth, etc.) -- patient_identifier_mrn represents a
+# hospital-issued administrative identifier, not a demographic attribute,
+# which is exactly why Tier 1 (identifier matching) and later
+# demographic-similarity tiers are separate pieces of logic.
 STRONG_ID_FIELD_PAIRS = [
-    ("ems_mrn", "ehr_mrn"),
+    ("ems_patient_identifier_mrn", "ehr_patient_identifier_mrn"),
 ]
 
 
