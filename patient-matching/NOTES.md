@@ -92,17 +92,92 @@ the contents of `data/` (real-world record-linkage work involves PHI, so
 we default to not committing data files even though this prototype only
 uses synthetic data).
 
+## Step 2: Synthetic dataset (2026-08-30)
+
+### What it is
+
+`src/generate_synthetic_data.py` generates `data/synthetic_ems_ehr_pairs.csv`
+— 500 candidate pairs, each one row with an EMS (ePCR) record and an EHR
+(ADT) record side by side, plus a ground-truth `is_match` column (1 = same
+real person, 0 = different people). Split is exactly 250/250. This is our
+"answer key": later, when we build the actual matching/scoring logic, we
+run it on this file *without* letting it see `is_match`, then compare its
+guesses against that column to measure precision/recall. `is_match` (and
+the debug-only `ems_person_id`/`ehr_person_id` columns) must never be used
+as an input feature to the matcher itself — that would be cheating, since
+a real system will never have that column.
+
+### How the data is generated
+
+For each **true match**, one clean "ground truth" person is generated with
+Faker, then two derived views are built from it: a clean-ish EHR record
+(the hospital's own system of record, so it always has a valid MRN) and a
+noisier EMS record. The EMS side gets several *independent, probabilistic*
+noise types layered on — meaning not every true match is equally messy;
+some pairs are nearly identical, some are quite corrupted, which mirrors
+real variance in documentation quality:
+
+- **Name**: nickname substitution (from a small hand-built map like
+  Robert→Bob, Katherine→Kathy) or a random single-letter typo (swap/drop/
+  duplicate) — 35% chance.
+- **DOB**: transposed day/month, or the year off by 1-2 — 25% chance.
+- **Address**: replaced with a random Faker address to represent the EMS
+  crew logging *where they found the patient* (scene of the 911 call)
+  rather than their home address — 40% chance.
+- **Missing fields**: DOB (5%), address (10%), phone (15%) blanked out
+  entirely, representing rushed or incomplete field documentation
+  (unconscious patient, refused history, etc.).
+- **Sex entry error**: rare (2%) flip of M/F, modeling a data-entry mistake.
+- **MRN**: EMS crews essentially never know the hospital's internal MRN
+  ahead of time, so it's blank ~90% of the time. The remaining ~10%
+  represents a case where the crew captured it from an insurance/ID card
+  on scene.
+
+**Non-match pairs** pull two *independent* Faker people — no identity
+noise is injected (they don't need help looking different) — but the same
+generic missingness (blank phone/address/DOB) is still applied, so a
+matcher can't cheat by using "has this field" as a proxy for "is a match."
+For the small fraction of non-matches where an EMS-side MRN-like value
+exists, it's deliberately a *different* value than the EHR's real MRN
+(e.g. a stale insurance card), rather than just being blank.
+
+Everything is seeded (`Faker.seed()` / `random.seed()`, default 42) so the
+same command regenerates an identical file — useful for reproducibility
+and for debugging.
+
+To regenerate: `.venv/bin/python src/generate_synthetic_data.py --n-pairs 500`
+(flags: `--n-pairs`, `--seed`, `--out`).
+
+### Known limitations of this dataset
+
+- **It's synthetic all the way down.** Faker produces plausible-looking
+  but statistically simplistic names/addresses (e.g. no real-world name
+  frequency distribution, no genuinely ambiguous common-surname clusters
+  at scale). Real EMS/EHR data will have messier, less uniform noise than
+  what we hand-coded here.
+- **Noise types are our own guesses**, not measured from real ePCR/EHR
+  error rates. The probabilities (35% typo, 25% DOB error, etc.) are
+  illustrative, not calibrated to any real dataset.
+- **Only one noise event per field per record**, not compounding
+  multi-error chaos that real rushed documentation can produce.
+- **No duplicate/multiple hospital visits** — every person appears exactly
+  once as a match candidate; a real system also has to handle the same
+  person showing up multiple times across many records.
+- **Committed to git** as `data/synthetic_ems_ehr_pairs.csv` since it's
+  fully synthetic (no real PHI) — `.gitignore` blocks everything else
+  under `data/` by default, with a narrow exception for `synthetic_*.csv`
+  files specifically, so a real data file dropped in `data/` won't
+  accidentally get committed.
+
 ## Open questions / things to decide next
 
-- What fields will our synthetic EMS vs. hospital records actually share?
-  (Likely candidates: name, DOB, sex, address, phone, incident/admission
-  date-time.) Need to decide the "messiness" we simulate (typos, missing
-  fields, nicknames) so it resembles real-world data quality issues.
 - Do we build our own scoring/matching logic first (using rapidfuzz) to
   understand the mechanics, before bringing in splink's probabilistic
   model? (Leaning toward yes — build intuition manually first, then let
   splink automate/improve it.)
-- How will we evaluate whether a match is "correct"? Since we're
-  generating the synthetic data ourselves, we can keep a hidden "ground
-  truth" ID to check our matching logic against — need to design that in
-  from the start.
+- Should we calibrate the noise probabilities against any published
+  research on ePCR data quality, or is illustrative noise good enough for
+  a learning prototype?
+- Do we eventually want a version of this generator that creates messier,
+  larger-scale data (e.g. thousands of records, multiple visits per
+  person) to stress-test performance, once the core matching logic works?

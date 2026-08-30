@@ -11,7 +11,8 @@ __pycache__/
 .vscode/
 
 # Local scratch data - real EMS/hospital data is sensitive (PHI) and should
-# never be committed. Synthetic/generated data we intentionally keep can be
-# added with `git add -f` if needed.
+# never be committed. Files explicitly named "synthetic_*" are fake data we
+# generated ourselves with Faker and are safe/intended to commit.
 data/*
 !data/.gitkeep
+!data/synthetic_*.csv
