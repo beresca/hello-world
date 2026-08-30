@@ -2,6 +2,14 @@
 Generate synthetic EMS (ePCR) <-> Hospital (EHR/ADT) record pairs for
 prototyping a patient-matching algorithm.
 
+GENERATOR VERSION: v2 (2026-08-30) -- true-match pairs now get typo noise
+injected into last_name as well as first_name (previously only first_name
+was noised, which made last_name unrealistically clean/always-exact). See
+NOTES.md "Step 4.5" for why this changed and what it affects. Running this
+script overwrites data/synthetic_ems_ehr_pairs.csv in place; NOTES.md
+records the date of each regeneration so v1-era results can still be
+understood if anything downstream needs to be compared against them.
+
 WHY SYNTHETIC DATA:
 Real ambulance and hospital records contain PHI (Protected Health
 Information) and can't be used for a personal prototype. Faker lets us
@@ -41,12 +49,15 @@ HOW THE NOISE WORKS (see NOTES.md for the full reasoning):
 We first generate a single "ground truth" person (clean name, DOB, sex,
 address, phone, race, ethnicity, email, etc). For a TRUE MATCH pair, both
 the EMS and EHR records are derived from that same person, but the EMS
-side has realistic messiness applied on top (typos, nicknames, a scene
-address instead of a home address, missing fields, etc.) because field
-documentation is rushed and often incomplete. For a NON-MATCH pair, the
-EMS record comes from one person and the EHR record comes from a totally
-different person, with only generic missingness applied (no
-identity-blurring noise -- they don't need help looking different).
+side has realistic messiness applied on top (typos/nicknames on
+first_name, typos on last_name, a scene address instead of a home
+address, missing fields, etc.) because field documentation is rushed and
+often incomplete. Last_name gets the same typo technique as first_name
+(swap/drop/duplicate a letter) but never the nickname substitution, since
+nicknames are a first-name concept. For a NON-MATCH pair, the EMS record
+comes from one person and the EHR record comes from a totally different
+person, with only generic missingness applied (no identity-blurring noise
+-- they don't need help looking different).
 
 Some of the newer USCDI fields (previous name, email address) are
 structurally absent on the EMS side regardless of match status: most
@@ -285,10 +296,11 @@ def build_ems_record(
     Build the EMS-side ePCR record derived from `person`.
 
     apply_identity_noise=True is used only for the EMS half of a TRUE
-    MATCH pair: it's what injects nicknames/typos/DOB corruption/scene
-    address, i.e. noise that makes a genuinely-the-same-person pair look
-    less obviously identical. Non-match pairs don't need this, since two
-    different Faker identities are already different.
+    MATCH pair: it's what injects nicknames/typos on first_name, typos on
+    last_name, DOB corruption, and scene address, i.e. noise that makes a
+    genuinely-the-same-person pair look less obviously identical.
+    Non-match pairs don't need this, since two different Faker identities
+    are already different.
 
     Generic missingness (blank phone/address/DOB, abbreviated middle name,
     dropped suffix, lower-quality race/ethnicity capture) is applied
@@ -301,12 +313,22 @@ def build_ems_record(
     absent from the form.
     """
     first_name = person["first_name"]
+    last_name = person["last_name"]
     dob_str = person["dob"].isoformat()
     address = person["home_address"]
 
     if apply_identity_noise:
         if rng.random() < 0.35:
             first_name = maybe_nickname_or_typo(first_name, rng)
+        if rng.random() < 0.35:
+            # Same typo technique as first_name, minus the nickname
+            # substitution (nicknames are a first-name concept -- nobody
+            # has a "nickname" for a surname). Real-world last-name noise
+            # like this comes from mishearing over radio, transposed
+            # letters, or inconsistent hyphenation; make_typo's
+            # swap/drop/duplicate operations are a reasonable stand-in for
+            # that family of errors without inventing new logic.
+            last_name = make_typo(last_name, rng)
         if rng.random() < 0.25:
             dob_str = corrupt_dob(person["dob"], rng)
         if rng.random() < 0.40:
@@ -364,7 +386,7 @@ def build_ems_record(
         "patient_identifier_mrn": ems_mrn,
         "first_name": first_name,
         "middle_name": middle_name,
-        "last_name": person["last_name"],
+        "last_name": last_name,
         "suffix": suffix,
         "previous_name": "",  # structurally absent on EMS forms -- see docstring
         "dob": dob_str,

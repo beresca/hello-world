@@ -422,14 +422,78 @@ whose surnames happen to sound alike).
 
 ### A known limitation this surfaced
 
-The `last_name_similarity`/phonetic features show **zero variation on
+~~The `last_name_similarity`/phonetic features show **zero variation on
 true matches in this dataset** — every one of the 250 true matches has an
 exactly identical `last_name` on both sides, because the Step 2 noise
 generator only ever injects typos/nicknames into `first_name`, never
-`last_name`. That's a real gap in the synthetic data, not a bug in the
-new features: in reality, last names get misspelled too. Worth revisiting
-the generator later to add last-name noise, so these particular features
-actually get exercised the way they're meant to be.
+`last_name`.~~ **RESOLVED 2026-08-30 — see Step 4.5 below.**
+
+## Step 4.5: Add last-name noise to the generator (2026-08-30)
+
+### What changed and why
+
+The limitation logged above was a real gap: real EMS last-name data gets
+garbled too (mishearing over radio, transposed letters, inconsistent
+hyphenation), so a dataset where `last_name` is always byte-for-byte
+identical between EMS and EHR was making our true matches unrealistically
+easy on that field — and meant `last_name_similarity` and the phonetic
+match features were never actually being exercised.
+
+**Fix, in `src/generate_synthetic_data.py` (now `GENERATOR VERSION: v2`):**
+`build_ems_record`'s identity-noise block now also runs `make_typo()` on
+`last_name` with the same 35% probability first_name gets its
+nickname-or-typo treatment. We reused the existing `make_typo()` function
+(swap/drop/duplicate a letter) rather than writing new logic, per the
+instruction to keep this a reuse, not a new noise mechanism — and
+deliberately did **not** apply nickname substitution to `last_name`,
+since "nicknames" are a first-name concept; nobody has a casual nickname
+for their own surname the way "Bob" stands in for "Robert."
+
+**Dataset regeneration:** this is v2 of the generator logic. Running
+`generate_synthetic_data.py` overwrites `data/synthetic_ems_ehr_pairs.csv`
+in place (same file path, same seed/CLI as before) — there is no
+separately kept v1 file, but this note plus the git history for that path
+is enough to reconstruct what v1 looked like if a future comparison ever
+needs it (v1 = the commit at `eab6916`/`f70d11a`, before this change; v2 =
+everything from this commit onward).
+
+### Verification
+
+Regenerated with `.venv/bin/python src/generate_synthetic_data.py
+--n-pairs 500`, then re-ran `.venv/bin/python src/similarity_features.py`
+to produce an updated `data/synthetic_ems_ehr_pairs_features.csv`.
+
+Last-name mismatch rate on true matches is now **88/250 = 35.2%** —
+right in line with the 35% probability parameter, matching first name's
+noise rate as requested. Example typos produced: `Smth`/`Smith`,
+`oRbles`/`Robles`, `Kellly`/`Kelly`, `iHll`/`Hill`.
+
+Updated mean scores by ground truth label (all 500 pairs):
+
+| | first_name_sim | last_name_sim | dob_sim | address_sim | soundex_match | nysiis_match |
+|---|---|---|---|---|---|---|
+| **true matches** | 0.978 | 0.979 | 0.936 | 0.720 | 0.932 | 0.808 |
+| **non-matches** | 0.433 | 0.413 | 0.001 | 0.373 | 0.008 | 0.004 |
+
+`last_name_similarity` on true matches now has real spread (mean 0.979,
+std 0.072, min 0.0) instead of being pinned at a constant 1.0 — confirmed
+88/250 true matches now score below 1.0 on it. The phonetic features also
+now show genuine disagreement: 17/250 true matches (6.8%) have a Soundex
+mismatch and 48/250 (19.2%) have a NYSIIS mismatch despite being the same
+person, which is exactly the kind of case Tier 2's decision logic needs
+to be able to tolerate rather than penalize too harshly.
+
+**A genuinely interesting edge case surfaced by this fix:** one true
+match, `Liu` → `iu` (the "drop first letter" typo), scored
+`last_name_similarity = 0.0` — not a bug, but a real property of the
+Jaro-Winkler algorithm: its comparison window shrinks with string length,
+and for a 2-3 character string, dropping the first character leaves no
+position where the algorithm considers the remaining letters "aligned,"
+so it registers as completely dissimilar even though a human would
+recognize it instantly as the same name missing a letter. Worth
+remembering once we design Tier 2's decision logic: very short names are
+a case where name-similarity scores alone can be misleadingly harsh, and
+phonetic codes or a minimum-length-aware fallback might matter more there.
 
 ## Open questions / things to decide next
 
@@ -437,10 +501,8 @@ actually get exercised the way they're meant to be.
   combination over these similarity scores) to catch the true matches
   Tier 1 correctly leaves undecided — measure recall *and* watch for
   false positives, since this is where wrong-but-confident matches start
-  becoming possible.
-- Add last-name typo/nickname noise to the Step 2 generator so the
-  last-name similarity and phonetic features actually get exercised by
-  true matches (currently they show no variation — see limitation above).
+  becoming possible. Keep the short-name Jaro-Winkler edge case (above)
+  in mind when designing thresholds.
 - Should we calibrate the noise probabilities (or the race/ethnicity
   population weights) against any published research, or is illustrative
   noise good enough for a learning prototype?
