@@ -27,8 +27,8 @@ data/*
 !data/resolved_rate_*.csv
 !data/normalization_*.csv
 data/splink_predictions_full_cross_join.csv
-# Step 10's full 250,000-row cross-join predictions (raw and normalized
-# variants) are the same ~54-56MB shape as the file above, for the same
-# reason -- reproducible by re-running src/normalization_impact_analysis.py.
-data/normalization_splink_predictions_raw.csv
-data/normalization_splink_predictions_normalized.csv
+# Step 10's full 250,000-row cross-join prediction variants (raw,
+# name-only, address-only, both-normalized) are the same ~54-56MB shape
+# as the file above, for the same reason -- reproducible by re-running
+# src/normalization_impact_analysis.py.
+data/normalization_splink_predictions_*.csv

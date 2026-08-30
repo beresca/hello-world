@@ -1573,6 +1573,58 @@ that adds formatting-only noise (the same address, reformatted, rather
 than always either byte-identical or wholesale different) as a
 deliberate test case.
 
+### Follow-up: which field actually drove the effect — name or address?
+
+The original run above only ever toggled name and address normalization
+*together*, so it couldn't say which one was responsible for the 79-pair
+review-queue reduction. `build_record_tables` was extended to switch each
+field independently, and the full 2×2 (raw / name-only / address-only /
+both) was re-run against the same Splink model and thresholds:
+
+| Variant | Auto-match | Review queue | Resolved rate | Precision/recall @0.5 |
+|---|---|---|---|---|
+| RAW | 243, 0 fp | 312 (7 true) | 1.0000 | 0.9185 / 0.9920 |
+| **Name only** normalized | 243, 0 fp | **233** (7 true) | 1.0000 | 0.9185 / 0.9920 |
+| **Address only** normalized | 243, 0 fp | **312** (7 true) | 1.0000 | 0.9185 / 0.9920 |
+| Both normalized | 243, 0 fp | 233 (7 true) | 1.0000 | 0.9185 / 0.9920 |
+
+**Name normalization alone reproduces 100% of the effect. Address
+normalization alone reproduces exactly 0% of it** — it is indistinguishable
+from RAW on every measured number, including review-queue size.
+
+This makes sense once you separate how the two comparisons work in the
+Splink model, and it sharpens the verdict above:
+- **Address's comparison (`cl.ExactMatch`) is strict byte-equality.**
+  Normalizing text before an exact-match check only changes the outcome
+  when the raw values are *almost but not quite* equal due to formatting
+  — precisely the case this dataset never generates (the core Step 10
+  finding). Normalizing a value that's either already byte-identical or
+  wholesale different cannot change an exact-match result either way,
+  which is exactly what was measured: zero difference, not "a small
+  difference."
+- **Name's comparison (`cl.NameComparison`) buckets a continuous
+  Jaro-Winkler score into threshold bands** (≥0.92, ≥0.88, ≥0.70, else).
+  Lowercasing and stripping punctuation can nudge a *coincidentally*
+  similar pair's score just enough to cross one of those band boundaries
+  — even with no genuine formatting difference to fix — which is almost
+  certainly what shrank the review queue: a handful of unrelated-name
+  pairs shifting bands, not any real match becoming more recognizable.
+
+**Practical implication for prioritization, now more specific than the
+original verdict:** on this evidence, the lightweight `usaddress`-based
+address standardization contributed *nothing* measurable — all of Step
+10's one real benefit came from the much cheaper plain-text
+normalization (lowercase, strip punctuation) applied to names. If forced
+to choose where to spend effort with what this dataset can show today,
+that argues for keeping name normalization (already nearly free) and
+*not* investing further in address-specific standardization work at all
+— an even stronger version of "don't prioritize CASS-grade address
+normalization" than the original verdict, though it inherits the same
+caveat: this dataset structurally can't test the address-formatting
+scenario CASS-grade normalization exists for, so this says "spend
+elsewhere given current evidence," not "address normalization is
+worthless in general."
+
 ## Open questions / things to decide next
 
 - Add formatting-only address/phone noise to the Step 2 generator (same

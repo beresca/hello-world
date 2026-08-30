@@ -200,15 +200,17 @@ def build_feature_comparison(pairs: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_record_tables(pairs: pd.DataFrame, use_normalization: bool):
+def build_record_tables(pairs: pd.DataFrame, normalize_name: bool, normalize_addr: bool):
     """Same shape as probabilistic_matcher.load_record_tables, but with
-    first_name/last_name/address optionally passed through the
-    normalization functions before Splink ever sees them. date_of_birth
-    and the phonetic codes are left exactly as Steps 5-7 built them --
-    this experiment is scoped to name/address per the existing Splink
-    model's actual comparisons."""
-    text_fn = normalize_text if use_normalization else (lambda x: x)
-    addr_fn = normalize_address if use_normalization else (lambda x: x)
+    first_name/last_name and address independently switchable through the
+    normalization functions before Splink ever sees them -- so a caller
+    can isolate which field's normalization is actually responsible for
+    any change, rather than only ever toggling both together.
+    date_of_birth and the phonetic codes are left exactly as Steps 5-7
+    built them -- this experiment is scoped to name/address per the
+    existing Splink model's actual comparisons."""
+    text_fn = normalize_text if normalize_name else (lambda x: x)
+    addr_fn = normalize_address if normalize_addr else (lambda x: x)
 
     def build_side(prefix):
         cols = {
@@ -232,8 +234,8 @@ def build_record_tables(pairs: pd.DataFrame, use_normalization: bool):
     return build_side("ems"), build_side("ehr")
 
 
-def run_splink_variant(pairs: pd.DataFrame, use_normalization: bool) -> pd.DataFrame:
-    ems_df, ehr_df = build_record_tables(pairs, use_normalization)
+def run_splink_variant(pairs: pd.DataFrame, normalize_name: bool, normalize_addr: bool) -> pd.DataFrame:
+    ems_df, ehr_df = build_record_tables(pairs, normalize_name, normalize_addr)
     n_true_matches = int((pairs["is_match"] == 1).sum())
     prior = n_true_matches / (len(ems_df) * len(ehr_df))
     settings = build_settings(prior)
@@ -327,34 +329,43 @@ def main():
         print(f"   rows where the score actually changed: {n_rows_changed} / {n_comparable} comparable pairs\n")
 
     # --- Splink model comparison (Step 5-7 model, raw vs normalized inputs) ---
-    print("\n=== Training Splink RAW variant (unmodified fields) ===\n")
-    raw_full = run_splink_variant(pairs, use_normalization=False)
+    # Full 2x2: isolates whether name normalization, address normalization,
+    # or both together are responsible for any observed change -- rather
+    # than only ever toggling both at once. Phone is never part of this
+    # model in any variant (Steps 5-7 never included it).
+    variants = [
+        ("RAW (no normalization)", False, False, "normalization_splink_predictions_raw.csv"),
+        ("NAME ONLY normalized", True, False, "normalization_splink_predictions_name_only.csv"),
+        ("ADDRESS ONLY normalized", False, True, "normalization_splink_predictions_address_only.csv"),
+        ("BOTH normalized", True, True, "normalization_splink_predictions_normalized.csv"),
+    ]
 
-    print("\n=== Training Splink NORMALIZED variant (lowercased, punctuation-stripped, address-standardized) ===\n")
-    norm_full = run_splink_variant(pairs, use_normalization=True)
-
-    raw_full.to_csv("data/normalization_splink_predictions_raw.csv", index=False)
-    norm_full.to_csv("data/normalization_splink_predictions_normalized.csv", index=False)
-
-    raw_report = three_way_report(raw_full, "RAW (no normalization)")
-    norm_report = three_way_report(norm_full, "NORMALIZED")
+    reports = []
+    for label, norm_name, norm_addr, out_path in variants:
+        print(f"\n=== Training Splink variant: {label} ===\n")
+        full = run_splink_variant(pairs, normalize_name=norm_name, normalize_addr=norm_addr)
+        full.to_csv(f"data/{out_path}", index=False)
+        reports.append(three_way_report(full, label))
 
     print("\n" + "=" * 70)
-    print("THREE-WAY BAND BREAKDOWN, RAW vs. NORMALIZED (full 250,000-pair cross-join)")
+    print("THREE-WAY BAND BREAKDOWN -- RAW / NAME-ONLY / ADDRESS-ONLY / BOTH (full 250,000-pair cross-join)")
     print("=" * 70 + "\n")
-    print_three_way(raw_report)
-    print_three_way(norm_report)
+    for r in reports:
+        print_three_way(r)
 
-    print("=== Delta (normalized - raw) ===")
-    for key in ["pct_auto", "pct_review", "pct_reject", "auto_precision", "resolved_rate",
-                "precision_at_0.5", "recall_at_0.5"]:
-        delta = norm_report[key] - raw_report[key]
-        print(f"  {key}: {delta:+.4f}")
+    raw_report = reports[0]
+    print("=== Delta vs. RAW, for each variant ===")
+    for r in reports[1:]:
+        print(f"-- {r['label']} --")
+        for key in ["pct_auto", "pct_review", "pct_reject", "auto_precision", "resolved_rate",
+                    "precision_at_0.5", "recall_at_0.5"]:
+            delta = r[key] - raw_report[key]
+            print(f"  {key}: {delta:+.4f}")
+        print()
 
-    pd.DataFrame([raw_report, norm_report]).to_csv("data/normalization_impact_summary.csv", index=False)
+    pd.DataFrame(reports).to_csv("data/normalization_impact_summary.csv", index=False)
     print("\nWrote data/normalization_feature_comparison.csv, "
-          "data/normalization_splink_predictions_raw.csv, "
-          "data/normalization_splink_predictions_normalized.csv, "
+          "data/normalization_splink_predictions_{raw,name_only,address_only,normalized}.csv, "
           "data/normalization_impact_summary.csv")
 
 
