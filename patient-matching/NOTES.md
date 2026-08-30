@@ -169,12 +169,67 @@ To regenerate: `.venv/bin/python src/generate_synthetic_data.py --n-pairs 500`
   files specifically, so a real data file dropped in `data/` won't
   accidentally get committed.
 
+## Step 3: Tier 1 — deterministic matching (2026-08-30)
+
+### What it is
+
+`src/deterministic_matcher.py` implements the first, most conservative
+matching tier: it only calls two records a match if they share the exact
+same value on a strong identifier field (currently just `mrn` — our
+dataset has no SSN field to also check, but the code is written so another
+strong ID could be added as a second field pair without restructuring
+anything). Both sides must have a *non-blank* value for the field before
+comparing — a blank on one side matching a blank on the other is explicitly
+NOT treated as a match, since "both unknown" isn't evidence of anything.
+This tier makes no judgment calls about *how similar* two records look; it
+either finds a confirmed shared ID or it doesn't.
+
+### Results on the synthetic dataset
+
+Run: `.venv/bin/python src/deterministic_matcher.py`
+
+```
+Total pairs evaluated:        500
+True matches in dataset:      250
+Non-matches in dataset:       250
+
+Pairs flagged as a match:     23
+  - correct (true positive):  23
+  - wrong (false positive):   0
+
+Recall on true matches:       9.2%
+Precision:                    100.0%
+```
+
+**Interpretation:**
+- **Precision is 100% and zero false positives were produced.** This
+  matches the design goal — a tier based on confirmed shared IDs should
+  essentially never be wrong, since it isn't guessing.
+- **Recall is only 9.2%** — it catches 23 of the 250 true matches and
+  correctly ignores every one of the other 227. That's expected, not a
+  bug: our generator only gives the EMS side a captured MRN ~10% of the
+  time (real ambulance crews usually don't know the hospital's internal
+  MRN), so ~90% of true matches structurally *can't* be resolved this way
+  — there's no shared ID to check in the first place.
+- The other 227 true matches (and all 250 non-matches) are pairs this
+  tier correctly declines to call either way — it isn't wrong about them,
+  it's silent about them. That silence is exactly the gap the next tier
+  (fuzzy matching on name/DOB/address with rapidfuzz) needs to close.
+
+### Why this design choice matters
+
+A tempting shortcut would be to also match on "close enough" IDs (e.g. MRN
+off by one digit), but that would blur this tier's whole purpose. Tier 1
+exists to be the one part of the system you can trust unconditionally; any
+fuzziness belongs in a later, explicitly probabilistic tier where we can
+also quantify the uncertainty.
+
 ## Open questions / things to decide next
 
-- Do we build our own scoring/matching logic first (using rapidfuzz) to
-  understand the mechanics, before bringing in splink's probabilistic
-  model? (Leaning toward yes — build intuition manually first, then let
-  splink automate/improve it.)
+- Build Tier 2 (fuzzy matching with rapidfuzz on name/DOB/address) next,
+  to catch the 227 true matches Tier 1 correctly leaves undecided — measure
+  its recall *and* watch for false positives, since fuzzy scoring is where
+  wrong-but-confident matches start becoming possible.
 - Should we calibrate the noise probabilities against any published
   research on ePCR data quality, or is illustrative noise good enough for
   a learning prototype?
