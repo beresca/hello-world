@@ -1416,8 +1416,170 @@ that's a property of how mild Step 2's noise still is (per Step 6's
 caveat), not a guarantee that stays true against harder real-world
 noise.
 
+## Step 10: does field normalization actually matter? (2026-08-30)
+
+### What this measures, and why we checked rather than assumed
+
+It's easy to assume "of course lowercasing and address standardization
+help" without ever measuring it. This step builds two versions of the
+name/address/phone comparison pipeline that differ in exactly one way —
+how much text normalization is applied before comparing — and runs both
+through the unmodified Step 5-7 Splink model and Step 6/7 evaluation
+harness, so any difference in the actual results (not just the raw
+similarity scores) is attributable to normalization alone.
+
+`src/normalization_impact_analysis.py`:
+- **RAW**: `first_name`, `last_name`, `address`, `phone_number` used
+  exactly as stored in the CSV — no lowercasing, no whitespace/punctuation
+  stripping, no address standardization.
+- **NORMALIZED**: lowercase, strip punctuation/dashes, collapse
+  whitespace for all four fields, plus address-specific standardization
+  using `usaddress` (added to `requirements.txt`) — it parses an address
+  into components (street number, street name, street type, occupancy
+  type, city, state, zip) so only the *street-type and occupancy-type
+  words specifically* get standardized to one canonical form (St/Street/
+  Str → `street`, Apt/Suite/Ste → `unit`, etc.), rather than a blind
+  find-and-replace across the whole string that could wrongly rewrite a
+  place name that happens to contain an abbreviation-like substring.
+  Falls back to plain text normalization when `usaddress` can't parse a
+  string as a street address (e.g. our synthetic APO/PSC military
+  addresses) or raises a parsing error.
+- Both variants feed the **same, unmodified Splink comparisons** from
+  Steps 5-7 (`cl.NameComparison` on first/last name, `cl.ExactMatch` on
+  address, unchanged DOB and Soundex comparisons) — this experiment
+  changes what values reach those comparisons, not the comparisons
+  themselves, so the result isolates normalization's effect specifically.
+- Phone was never part of the Tier 3 Splink model (Steps 5-7 only ever
+  compared first/last name, DOB, address, and last-name phonetics), and
+  isn't added to it here — its raw-vs-normalized delta is reported at the
+  Step-4-style feature level only, not reflected in the Splink
+  precision/recall numbers below.
+
+### 1-2. Feature-level result: true matches barely move, non-matches drift slightly
+
+Mean similarity score by ground truth, raw vs. normalized, across all 500
+designed pairs:
+
+| Field | True matches (raw → normalized) | Non-matches (raw → normalized) | True-match rows that actually changed |
+|---|---|---|---|
+| first_name | 0.9784 → 0.9784 (unchanged) | 0.3924 → 0.4331 | 0 / 250 |
+| last_name | 0.9789 → 0.9789 (unchanged) | 0.3848 → 0.4129 | 0 / 250 |
+| phone_number | 1.0000 → 1.0000 (unchanged) | 0.5508 → 0.5626 | 0 / 250 |
+| address | 0.7058 → 0.7239 (+0.018) | 0.3483 → 0.3758 | 97 / 250 |
+
+**First name, last name, and phone show zero change on any true-match
+row** — verified directly, not just in the aggregate mean. **Address
+shows a small, real shift** (+0.018 on the true-match mean), confined
+entirely to the 97 true matches where the two addresses are genuinely
+different places (Step 2's scene-vs-home noise) — normalization didn't
+make those look *more like a match*, it modestly changed how much
+coincidental token overlap two unrelated addresses share (shared city or
+state words counting slightly differently once case/punctuation drop
+out). The 121 true matches with an *identical* address were unaffected
+either way, since an identical string normalizes to another identical
+string.
+
+**Non-match scores drift upward slightly on every field** (e.g. first
+name 0.392 → 0.433) — normalization doesn't create false confidence by
+itself here; it's coincidental token/character overlap between unrelated
+people's names becoming very slightly more visible once casing and
+punctuation stop acting as accidental tie-breakers. Small enough that it
+never crosses a decision threshold in this evaluation (confirmed below).
+
+### 3-4. Splink model result: identical decisions, smaller review queue
+
+Both variants — trained fresh, same comparisons, same thresholds
+(auto-match ≥0.995, review floor 0.015 from Step 7) — scored against the
+full 250,000-pair cross-join:
+
+| | RAW | NORMALIZED | Delta |
+|---|---|---|---|
+| Auto-match | 243 pairs (0.0972%), 243 tp, 0 fp, precision 1.0000 | 243 pairs (0.0972%), 243 tp, 0 fp, precision 1.0000 | **0** |
+| Review queue | 312 pairs (0.1248%), 7 true matches | 233 pairs (0.0932%), 7 true matches | **−79 pairs, 0 true matches** |
+| Auto-reject | 249,445 pairs, 0 missed | 249,524 pairs, 0 missed | **0** |
+| Resolved rate | 1.0000 | 1.0000 | **0** |
+| Precision / recall @ 0.5 | 0.9185 / 0.9920 | 0.9185 / 0.9920 | **0** |
+
+**Every true-match outcome is byte-identical between the two variants** —
+same 243 auto-matched, same 7 in review, same 0 missed, same resolved
+rate, same precision/recall at every threshold checked. The **only**
+difference anywhere in the full evaluation: the review queue shrank by
+**79 pairs (25.3% smaller)**, and every one of those 79 removed pairs was
+a **non-match** — normalization pushed some coincidentally-similar
+unrelated pairs down below the review floor, so a reviewer would spend
+noticeably less time on obviously-wrong candidates, without the auto-
+match/reject decisions for any real person changing at all.
+
+### 5. Why the impact is this small — a structural property of the dataset, not a weak normalization implementation
+
+Traced why, rather than leaving it as a surprising null result: **for a
+true-match pair in this synthetic dataset, a field's value is either
+copied byte-for-byte identical between the EMS and EHR sides, or replaced
+with a wholesale different value (a typo, a different address, a missing
+value) — there is no synthetic mechanism that produces the same
+real-world value in two different *formats*.** Verified directly:
+- **217 of 217** true matches with a phone number on both sides have
+  byte-identical phone strings (Step 2 copies `person["phone"]` to both
+  records, formatting and all — it never independently reformats it).
+- **0** true matches have a first name that matches case-insensitively
+  but differs in case (typos preserve case; nicknames are `.capitalize()`d
+  consistently).
+- Every true-match address is either byte-identical (121/218 with both
+  sides present) or a **completely different, unrelated address** — Step
+  6 already found this distribution is sharply bimodal; there is no
+  "same place, different abbreviation style" middle case anywhere in the
+  data to normalize away.
+
+**This means the experiment, run faithfully on this dataset, cannot
+speak to normalization's real-world value** — the exact failure mode
+field normalization exists to fix ("123 Main St" vs. "123 Main Street"
+for the *same* address, "(555) 123-4567" vs. "555.123.4567" for the
+*same* phone) never occurs here, because Step 2's generator only ever
+fully replaces a field or leaves it untouched, never reformats it. The
+measured zero-impact-on-outcomes result is real and correctly measured,
+but it is a statement about this dataset's coverage gap, not a general
+finding that normalization doesn't matter.
+
+**One concrete limitation surfaced in the normalization code itself,
+independent of the above:** `usaddress`'s parser (trained on real postal
+address data) doesn't reliably tag Faker's stylized, sometimes-pluralized
+street suffixes (e.g. "Jeffery **Parkways**", "Taylor **Vistas**") as a
+standardizable street type the way it does standard USPS suffixes — a
+real gap in coverage even setting aside the dataset issue above, and a
+preview of the kind of imperfect real-world address parsing any
+normalization approach (light or CASS-grade) has to tolerate.
+
+### Verdict: don't prioritize CASS-grade normalization based on this evidence
+
+**Plain answer to the question asked:** on this dataset, normalization
+changed the auto-match rate by **0.0 percentage points** and the overall
+resolved rate by **0.0 percentage points**. The one real, measured
+benefit — a 25.3% smaller review queue with no true matches lost from
+it — is a genuine operational win (less reviewer time on obvious
+non-matches) but a modest one, not a result that would justify investing
+in real CASS-grade address standardization (USPS certification, a paid
+address-validation service, deliverability-level parsing) over the
+lighter `usaddress`-based approach used here. **That conclusion comes
+with the caveat above attached, not instead of it**: this evaluation
+structurally cannot detect the scenario CASS-grade normalization is
+actually built for (matching the same real address written in two
+different formats), so "no measured benefit" here should be read as
+"this dataset can't tell us yet," not "normalization sophistication is
+provably not worth it." Before spending real engineering effort on
+heavier normalization, get an answer from a source that can actually
+test it: either real pilot data (which will have genuine formatting
+variation NEMSIS/HL7 feeds never agree on) or a Step 2 generator revision
+that adds formatting-only noise (the same address, reformatted, rather
+than always either byte-identical or wholesale different) as a
+deliberate test case.
+
 ## Open questions / things to decide next
 
+- Add formatting-only address/phone noise to the Step 2 generator (same
+  real value, different format — abbreviation style, punctuation,
+  casing) so a future re-run of Step 10's experiment can actually test
+  what normalization is designed for, rather than hitting the structural
+  gap described there.
 - Get the NEMSIS/HL7 field mapping in Step 8 validated against the
   current NEMSIS Data Dictionary/XSD and the pilot hospital's actual PID
   segment usage — this document's mapping is conceptual, not verified
