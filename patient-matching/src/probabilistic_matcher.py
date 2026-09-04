@@ -91,9 +91,14 @@ def load_record_tables(path: str = FEATURES_CSV):
     pairs = pd.read_csv(path, dtype=str, keep_default_na=False)
     pairs["is_match"] = pairs["is_match"].astype(int)
 
+    # phone_number is loaded here (harmless -- it's an unused column unless
+    # a comparisons list actually references it) but is NOT part of
+    # build_settings() below, so every existing model/evaluation in Steps
+    # 5-10 is unaffected. See src/phone_comparison_experiment.py (Step 11)
+    # for the variant that actually compares on it.
     ems_df = pairs[[
         "ems_record_id", "ems_first_name", "ems_last_name", "ems_date_of_birth",
-        "ems_address", "ems_last_name_soundex", "ems_last_name_nysiis",
+        "ems_address", "ems_last_name_soundex", "ems_last_name_nysiis", "ems_phone_number",
     ]].rename(columns={
         "ems_record_id": "unique_id",
         "ems_first_name": "first_name",
@@ -102,11 +107,12 @@ def load_record_tables(path: str = FEATURES_CSV):
         "ems_address": "address",
         "ems_last_name_soundex": "last_name_soundex",
         "ems_last_name_nysiis": "last_name_nysiis",
+        "ems_phone_number": "phone_number",
     })
 
     ehr_df = pairs[[
         "ehr_record_id", "ehr_first_name", "ehr_last_name", "ehr_date_of_birth",
-        "ehr_address", "ehr_last_name_soundex", "ehr_last_name_nysiis",
+        "ehr_address", "ehr_last_name_soundex", "ehr_last_name_nysiis", "ehr_phone_number",
     ]].rename(columns={
         "ehr_record_id": "unique_id",
         "ehr_first_name": "first_name",
@@ -115,11 +121,12 @@ def load_record_tables(path: str = FEATURES_CSV):
         "ehr_address": "address",
         "ehr_last_name_soundex": "last_name_soundex",
         "ehr_last_name_nysiis": "last_name_nysiis",
+        "ehr_phone_number": "phone_number",
     })
 
     for df in (ems_df, ehr_df):
         for col in ["first_name", "last_name", "date_of_birth", "address",
-                    "last_name_soundex", "last_name_nysiis"]:
+                    "last_name_soundex", "last_name_nysiis", "phone_number"]:
             df[col] = _blank_to_nan(df[col])
 
     return ems_df, ehr_df, pairs

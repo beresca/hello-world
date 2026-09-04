@@ -1625,8 +1625,177 @@ scenario CASS-grade normalization exists for, so this says "spend
 elsewhere given current evidence," not "address normalization is
 worthless in general."
 
+## Step 11: review-queue UI feedback + adding phone as a real signal (2026-08-30)
+
+### Where this came from
+
+A prototype review-queue UI was built separately (v0, screenshot walked
+through in conversation, not committed to this repo) showing a
+side-by-side EMS/EHR pair table — "Encounter Match Review," score bands
+(High/Med/Low), a "Code matched" indicator, a "Within window" indicator,
+and an "X/14" fraction per pair. Reviewing it against what this project
+has actually built surfaced three findings worth recording, plus a
+fourth (phone) that was worth actually testing rather than just noting.
+
+### 1. A confirmed-MRN pair showed up in the review queue — it shouldn't
+
+One mocked row had a matching MRN on both the EMS and EHR side, yet still
+appeared in the review queue rather than being auto-resolved. Confirmed:
+this is a gap in the prototype UI, not a deliberate design choice — the
+mockup was built before the tiered auto-match/review/reject structure
+(Steps 3, 7) existed. An exact MRN match is Tier 1's job and should
+essentially never need human review (Step 3: 100% precision when
+present). Worth deciding on purpose whether a production system audits
+*every* merge regardless of confidence (a legitimate, more conservative
+choice) or only routes what the auto-tier couldn't resolve — but whichever
+is chosen, it should be a decision, not an artifact of the prototype
+never having modeled the tiers at all.
+
+### 2. "Code matched" should be two source-document references, and there's a real survivorship question underneath it
+
+The "Code matched" badge was actually meant to represent two lines — a
+reference/link into the EHR record and the ePCR record, so a reviewer
+can open the actual source documents rather than trust an opaque badge.
+That's a real improvement: traceability back to source is exactly the
+audit trail Step 8 already flagged as a requirement once real data is
+involved.
+
+A sharper question came with it: when the EMS-documented address and the
+hospital's ADT address disagree, which should a reviewer (or the system)
+default to trusting? This is precisely the **survivorship rule** concept
+from Step 8 — "when two linked records disagree, which value wins" —
+surfacing again from a completely different direction (UI design instead
+of EMPI architecture). The reasoning holds up: the ADT feed comes from
+the receiving facility's own controlled registration process; the ePCR's
+location is captured in the field, often under time pressure, and (Step
+2's design, Step 6's findings) is frequently the *scene* of the incident
+rather than the patient's home address at all. **Default: ADT/EHR as the
+authoritative source for identity fields (name, address, DOB); ePCR
+trusted for what only EMS would know** (vitals, scene circumstances,
+transport details). This should be an explicit, documented rule before
+any real survivorship logic gets built, not left implicit in whichever
+system happens to write last.
+
+### 3. "Within window" confirms a real, still-unbuilt gap
+
+Confirmed: "within window" checks whether the EMS incident timestamp and
+the hospital arrival timestamp are close enough in time to plausibly be
+the same encounter. This is exactly the temporal-proximity blocking
+concept Step 8 flagged as an unusually strong, domain-specific signal for
+this problem — and confirms the gap noted there is real: we have
+`ems_incident_timestamp`/`ehr_admit_timestamp` in the raw data, but
+nothing in the Tier 3 model actually scores time proximity as matching
+evidence yet. The prototype UI is ahead of the model on this one specific
+point.
+
+### 4. The "X/14" score is a placeholder, confirmed — and phone number is a real, tested gap
+
+Confirmed: the "X/14" fraction was a simple points-count placeholder (how
+many of the available fields happen to match), unrelated to the actual
+weighted Fellegi-Sunter score — safe to drop once this UI is wired to
+real output, in favor of the actual `match_probability`/`match_weight`.
+
+Separately, reviewing the UI raised a substantive question: phone number
+isn't part of the matching model at all, on the belief that EMS
+documents it too rarely to be useful. Checked that against our own data
+rather than accept or dismiss it on intuition:
+
+| | Value |
+|---|---|
+| EMS phone captured on true matches | 86.8% (217/250) |
+| Correct when present on both sides | 100% (217/217) |
+| Coincidental match among non-matches | 0 (0/214 with both sides present) |
+
+Far from sparse in this dataset — captured about as often as other core
+fields — and perfectly reliable when present. That's a strong, unused
+signal, so it was worth actually testing rather than leaving as a
+hypothesis.
+
+### Testing it: adding phone_number to Tier 3
+
+`src/phone_comparison_experiment.py` trains two models fresh from the
+same data: the unmodified Step 5-7 baseline, and an identical model with
+one addition, `cl.ExactMatch("phone_number")` (exact match, not fuzzy —
+checked the generator first: phone is either copied byte-for-byte or
+blanked, never typo'd, the same structural pattern Step 5 already found
+for address, so a fuzzy comparison would have nothing real to train
+partial-agreement levels from). `probabilistic_matcher.load_record_tables`
+was extended to also carry `phone_number` into the per-record tables —
+a harmless addition on its own, since nothing referenced it until this
+new comparisons list did; confirmed the unmodified baseline model
+produces byte-identical output before and after that change.
+
+**What the model learned:** phone_number's exact-match weight is
+**+9.92 log₂(m/u)** (m=0.975, u=0.001) — the single strongest level in
+the *entire* model, edging out even address (+9.88) and DOB (+9.83).
+
+**Effect on the full 250,000-pair evaluation, at the same Step 7
+thresholds (auto-match ≥0.995, review floor 0.015):**
+
+| | Baseline (no phone) | With phone | Delta |
+|---|---|---|---|
+| Auto-match | 243 (0.0972%), 0 fp | **247** (0.0988%), 0 fp | **+4 true matches, still 0 fp** |
+| Review queue | 312 pairs, 7 true | **53 pairs**, 3 true | **−259 pairs (83% smaller)** |
+| Auto-reject | 249,445, 0 missed | 249,700, 0 missed | 0 |
+| Resolved rate | 1.0000 | 1.0000 | 0 |
+
+**Resolved rate doesn't move (everything was already reachable either
+way, per Step 9's finding that the auto-match/review split is a
+cost decision, not a coverage one) — but the composition shifts
+dramatically in the right direction: 4 more true matches get auto-
+matched with zero new false positives, and the review queue shrinks by
+83%,** meaning a reviewer would spend far less time sorting through
+coincidental non-match noise to find the small number of real matches
+still needing a human.
+
+**What happened to the two hardest cases we've tracked since Step 4.5:**
+
+| Pair | Baseline probability | With phone | What changed |
+|---|---|---|---|
+| `P00234` ("Liu"→"iu") | 0.017759 | 0.017711 (≈unchanged) | EMS phone was **blank** for this pair — no new evidence existed to add |
+| `P00037` ("Berry"→"erry") | 0.060453 | **0.984201** | Phone was present and correct on both sides — **fully rescued**, jumping from deep in review-queue territory to just under the auto-match line |
+
+This is the cleanest possible confirmation of the hypothesis and its
+limit in the same result: phone rescues a hard case *when it's actually
+there*, and does nothing when it isn't — exactly what "high accuracy,
+moderate completeness" evidence should do, with a concrete example of
+each outcome rather than an aggregate number alone.
+
+**Verdict: adopt phone_number as a real Tier 3 comparison going
+forward.** Unlike Step 10's normalization experiment, this isn't a null
+result hitting a synthetic-data blind spot — it's a clear, mechanism-
+explained improvement (more auto-matches at unchanged precision, a much
+smaller review queue, a named case rescued) backed by real numbers on
+both sides of the change. `probabilistic_matcher.py`'s official
+`build_settings()` was intentionally left unmodified here so Steps 5-10's
+documented results stay exactly reproducible as written; promoting this
+into the standard model is the natural next step, tracked below.
+
+**One caveat carried over, same shape as address in Step 6:** the "zero
+coincidental match" figure shares Step 6's synthetic-data limitation —
+Faker draws a unique phone number per person with no simulated shared
+household phone, so real-world non-match collision risk (family members
+sharing a landline) isn't tested here. The completeness and
+correct-when-present numbers don't share that limitation and are solid.
+
 ## Open questions / things to decide next
 
+- Promote `phone_number` into `probabilistic_matcher.py`'s official
+  `build_settings()` now that Step 11 has measured a real, unambiguous
+  improvement — and re-run Step 7's threshold analysis afterward, since
+  a materially different score distribution may support a different (or
+  the same) auto-match cutoff.
+- Decide and document the survivorship rule from Step 11 point 2 (ADT/EHR
+  wins for identity fields, ePCR wins for field-only knowledge) before
+  any real survivorship logic gets built, per Step 8's EMPI discussion.
+- Add temporal proximity (EMS incident time vs. hospital arrival time) as
+  a real Tier 3 comparison, not just a descriptive field — Step 8 flagged
+  this as an unusually strong domain-specific signal, and Step 11's UI
+  review confirmed it's still unbuilt.
+- Decide whether a production system routes every match (including
+  high-confidence auto-matches) through human review for audit purposes,
+  or only what the auto-tier couldn't resolve — Step 11 point 1 found the
+  prototype UI hadn't made this decision on purpose.
 - Add formatting-only address/phone noise to the Step 2 generator (same
   real value, different format — abbreviation style, punctuation,
   casing) so a future re-run of Step 10's experiment can actually test

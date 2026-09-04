@@ -26,9 +26,15 @@ data/*
 !data/threshold_*.csv
 !data/resolved_rate_*.csv
 !data/normalization_*.csv
+!data/phone_experiment_*.csv
+!data/phone_experiment_*.json
 data/splink_predictions_full_cross_join.csv
 # Step 10's full 250,000-row cross-join prediction variants (raw,
 # name-only, address-only, both-normalized) are the same ~54-56MB shape
 # as the file above, for the same reason -- reproducible by re-running
 # src/normalization_impact_analysis.py.
 data/normalization_splink_predictions_*.csv
+# Step 11's full 250,000-row cross-join predictions (baseline and
+# with-phone) are the same large shape, reproducible by re-running
+# src/phone_comparison_experiment.py.
+data/phone_experiment_predictions_*.csv
